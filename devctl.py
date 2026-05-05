@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-devctl v0.3 — project-agnostic pure-Python AI patch conveyor.
+devctl v0.4 — project-agnostic pure-Python AI patch conveyor.
+
+Default conveyor flow: apply patch -> run checks -> commit -> push.
 
 Commands:
     python tools/devctl.py init --project ./project
@@ -29,7 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-DEVCTL_VERSION = "0.3"
+DEVCTL_VERSION = "0.4"
 STATE_VERSION = 1
 DEFAULT_PROJECT_DIR_NAME = "project"
 DEFAULT_PATCHES_DIR_NAME = "patches"
@@ -147,6 +149,10 @@ class RunContext:
     failed_archive: Path | None = None
     commit_sha: str | None = None
     push_result: str | None = None
+    push_enabled: bool = True
+    push_remote: str | None = None
+    push_branch: str | None = None
+    push_policy_note: str = "devctl default: push after successful checks and commit"
     applied_started: bool = False
     copied_files: list[str] = field(default_factory=list)
     deleted_paths: list[str] = field(default_factory=list)
@@ -759,7 +765,70 @@ def ahead_behind(project_root: Path, remote: str, branch: str) -> tuple[int | No
     return int(parts[0]), int(parts[1]), None
 
 
-def validate_git_preflight(workspace: Workspace, manifest: dict[str, Any], ctx: RunContext | None = None) -> None:
+def workspace_git_config(workspace: Workspace) -> dict[str, Any]:
+    config_path = workspace.state_dir / "workspace.json"
+    if not config_path.is_file():
+        return {}
+    try:
+        data = read_json_file(config_path)
+    except DevctlError:
+        return {}
+    git_cfg = data.get("git")
+    return git_cfg if isinstance(git_cfg, dict) else {}
+
+
+def bool_from_config(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    return default
+
+
+def effective_push_policy(
+    workspace: Workspace,
+    manifest: dict[str, Any],
+    *,
+    no_push: bool = False,
+    current_branch: str | None = None,
+) -> tuple[bool, str, str, str]:
+    """Return (enabled, remote, branch, note) for the devctl push step.
+
+    The patch manifest may provide the push target, but it does not own the
+    workflow policy. By default, `devctl start` is the magic button: green
+    checks are followed by commit and push. Use `devctl start --no-push` only
+    for explicit local-only/debug runs.
+    """
+    git_cfg = workspace_git_config(workspace)
+    push_cfg = manifest.get("push") if isinstance(manifest.get("push"), dict) else {}
+
+    remote = push_cfg.get("remote") or git_cfg.get("remote") or "origin"
+    branch = push_cfg.get("branch") or git_cfg.get("branch") or current_branch or "main"
+    if not isinstance(remote, str) or not remote.strip():
+        remote = "origin"
+    if not isinstance(branch, str) or not branch.strip():
+        branch = current_branch or "main"
+
+    if no_push:
+        return False, remote, branch, "disabled by CLI --no-push"
+
+    if bool_from_config(git_cfg.get("enabled"), True) is False:
+        return False, remote, branch, "disabled by workspace git.enabled=false"
+
+    if bool_from_config(git_cfg.get("autoPush"), True) is False:
+        return False, remote, branch, "disabled by workspace git.autoPush=false"
+
+    if push_cfg.get("enabled") is False:
+        return True, remote, branch, "manifest push.enabled=false ignored; devctl default is commit+push after green checks"
+
+    return True, remote, branch, "devctl default: push after successful checks and commit"
+
+
+def validate_git_preflight(
+    workspace: Workspace,
+    manifest: dict[str, Any],
+    ctx: RunContext | None = None,
+    *,
+    no_push: bool = False,
+) -> None:
     if not git_available():
         raise PreflightError("git command not found")
     if not (workspace.project_root / ".git").exists():
@@ -784,16 +853,23 @@ def validate_git_preflight(workspace: Workspace, manifest: dict[str, Any], ctx: 
     if expected_branch and current_branch != expected_branch:
         raise PreflightError(f"Patch expects branch {expected_branch!r}, current branch is {current_branch!r}")
 
-    push = manifest.get("push") if isinstance(manifest.get("push"), dict) else {}
-    push_enabled = push.get("enabled", True)
+    push_enabled, remote, branch, note = effective_push_policy(
+        workspace, manifest, no_push=no_push, current_branch=current_branch
+    )
+    if ctx:
+        ctx.push_enabled = push_enabled
+        ctx.push_remote = remote
+        ctx.push_branch = branch
+        ctx.push_policy_note = note
+        if "ignored" in note:
+            ctx.warnings.append(note)
+
     if not push_enabled:
         return
-    remote = push.get("remote", "origin")
-    branch = push.get("branch") or current_branch
     if not isinstance(remote, str) or not remote:
-        raise PreflightError("manifest.push.remote must be a non-empty string")
+        raise PreflightError("push remote must be a non-empty string")
     if not isinstance(branch, str) or not branch:
-        raise PreflightError("manifest.push.branch must be a non-empty string")
+        raise PreflightError("push branch must be a non-empty string")
 
     fetch_remote(workspace.project_root, remote)
     ahead, behind, error = ahead_behind(workspace.project_root, remote, branch)
@@ -1247,9 +1323,9 @@ def dangerous_git_changes(status_text: str) -> list[str]:
 def commit_and_push(ctx: RunContext) -> None:
     project_root = ctx.workspace.project_root
     commit_cfg = ctx.manifest.get("commit") if isinstance(ctx.manifest.get("commit"), dict) else {}
-    push_cfg = ctx.manifest.get("push") if isinstance(ctx.manifest.get("push"), dict) else {}
-    commit_enabled = commit_cfg.get("enabled", True)
-    push_enabled = push_cfg.get("enabled", True)
+
+    if commit_cfg.get("enabled") is False:
+        ctx.warnings.append("manifest.commit.enabled=false ignored; devctl default is commit after green checks")
 
     current_status = git_status_porcelain(project_root)
     dangerous = dangerous_git_changes(current_status)
@@ -1258,15 +1334,8 @@ def commit_and_push(ctx: RunContext) -> None:
             "Refusing to commit dangerous generated/local files: " + ", ".join(dangerous)
         )
 
-    if not current_status.strip():
-        if commit_cfg.get("allowEmpty", False) and commit_enabled:
-            pass
-        else:
-            ctx.warnings.append("No Git changes after patch/checks; commit skipped.")
-            return
-
-    if not commit_enabled:
-        ctx.warnings.append("manifest.commit.enabled=false; commit skipped.")
+    if not current_status.strip() and not commit_cfg.get("allowEmpty", False):
+        ctx.warnings.append("No Git changes after patch/checks; commit and push skipped.")
         return
 
     add_result = git(project_root, ["add", "-A"], timeout=120)
@@ -1290,15 +1359,16 @@ def commit_and_push(ctx: RunContext) -> None:
         raise DevctlError(f"git commit failed: {commit_stderr.strip() or commit_stdout.strip()}")
     ctx.commit_sha = git_head(project_root)
 
-    if not push_enabled:
-        ctx.push_result = "skipped: manifest.push.enabled=false"
+    if not ctx.push_enabled:
+        ctx.push_result = "skipped: " + (ctx.push_policy_note or "push disabled")
         return
-    remote = push_cfg.get("remote", "origin")
-    branch = push_cfg.get("branch") or git_branch(project_root)
+
+    remote = ctx.push_remote or "origin"
+    branch = ctx.push_branch or git_branch(project_root)
     if not isinstance(remote, str) or not remote:
-        raise DevctlError("manifest.push.remote must be a non-empty string")
+        raise DevctlError("push remote must be a non-empty string")
     if not isinstance(branch, str) or not branch:
-        raise DevctlError("manifest.push.branch must be a non-empty string")
+        raise DevctlError("push branch must be a non-empty string")
     push_result = git(project_root, ["push", remote, f"HEAD:{branch}"], timeout=240)
     if push_result.returncode != 0:
         ctx.push_result = push_result.stderr.strip() or push_result.stdout.strip()
@@ -1385,6 +1455,10 @@ def report_lines(ctx: RunContext, finished_at: datetime) -> list[str]:
         for warning in ctx.archive_size_warnings:
             lines.append(f"- {warning}\n")
     lines.append("\n## Commit / push\n\n")
+    lines.append("- Conveyor policy: `checks -> commit -> push` by default\n")
+    lines.append(f"- Push enabled: `{ctx.push_enabled}`\n")
+    lines.append(f"- Push target: `{(ctx.push_remote or 'origin')}/{(ctx.push_branch or ctx.git_branch or 'current')}`\n")
+    lines.append(f"- Push policy note: `{ctx.push_policy_note}`\n")
     lines.append(f"- Commit SHA: `{ctx.commit_sha or 'none'}`\n")
     lines.append(f"- Push result: `{ctx.push_result or 'none'}`\n")
     lines.append("\n## Warnings\n\n")
@@ -1602,7 +1676,7 @@ def prepare_context(workspace: Workspace, state: dict[str, Any]) -> RunContext |
     return RunContext(workspace=workspace, patch=patch, manifest=manifest, started_at=now_utc())
 
 
-def start_command() -> int:
+def start_command(args: argparse.Namespace) -> int:
     try:
         workspace = discover_workspace()
         validate_workspace_for_start(workspace)
@@ -1616,7 +1690,7 @@ def start_command() -> int:
             validate_patch_files_root(ctx.patch, ctx.manifest)
 
             # Git/environment prerequisites are deliberately checked before creating a pre archive or applying patch.
-            validate_git_preflight(workspace, ctx.manifest, ctx)
+            validate_git_preflight(workspace, ctx.manifest, ctx, no_push=args.no_push)
             validate_check_prerequisites(workspace.project_root, ctx.manifest)
 
             ctx.run_dir = create_run_dir(workspace, ctx.manifest, ctx.patch.sha256)
@@ -1809,6 +1883,8 @@ def init_command(args: argparse.Namespace) -> int:
         "archivesDir": posix_rel_or_dot(archives_dir, workspace_root),
         "git": {
             "enabled": True,
+            "autoCommit": True,
+            "autoPush": True,
             "remote": "origin",
             "requireClean": True,
             "requireUpToDate": True,
@@ -1917,11 +1993,20 @@ def inspect_command(args: argparse.Namespace, *, plan: bool = False) -> int:
         print("No checks declared.")
 
     print_header("commit / push")
-    print(f"Commit enabled: {commit.get('enabled', True)}")
-    print(f"Commit message: {commit.get('message', '')}")
-    print(f"Push enabled:   {push.get('enabled', True)}")
-    if push.get('remote') or push.get('branch'):
-        print(f"Push target:    {push.get('remote', 'origin')}/{push.get('branch', '<current>')}")
+    try:
+        current_branch = git_branch(workspace.project_root)
+    except DevctlError:
+        current_branch = None
+    push_enabled, remote, branch, note = effective_push_policy(
+        workspace, manifest, current_branch=current_branch
+    )
+    print("Conveyor policy: checks -> commit -> push by default")
+    print(f"Commit message:  {commit.get('message', '')}")
+    if commit.get("enabled") is False:
+        print("Commit note:     manifest commit.enabled=false will be ignored by start")
+    print(f"Push enabled:    {push_enabled}")
+    print(f"Push target:     {remote}/{branch}")
+    print(f"Push note:       {note}")
 
     if plan:
         print_header("dry-run")
@@ -1949,7 +2034,8 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("patch", nargs="?", help="Patch zip path/name. Defaults to latest patch in patches/.")
     plan = subparsers.add_parser("plan", help="Dry-run plan for a patch zip without modifying anything")
     plan.add_argument("patch", nargs="?", help="Patch zip path/name. Defaults to latest patch in patches/.")
-    subparsers.add_parser("start", help="Apply latest unapplied patch and run the conveyor")
+    start = subparsers.add_parser("start", help="Apply latest unapplied patch, run checks, commit and push")
+    start.add_argument("--no-push", action="store_true", help="Debug/local-only run: commit after green checks but skip git push")
     return parser
 
 
@@ -1966,7 +2052,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "plan":
             return inspect_command(args, plan=True)
         if args.command == "start":
-            return start_command()
+            return start_command(args)
     except DevctlError as exc:
         print(f"[ERROR] {exc}")
         return 2

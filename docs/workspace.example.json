@@ -5,6 +5,8 @@
   "archivesDir": "archives",
   "git": {
     "enabled": true,
+    "autoCommit": true,
+    "autoPush": true,
     "remote": "origin",
     "requireClean": true,
     "requireUpToDate": true
@@ -18,9 +20,14 @@
       "build",
       "coverage",
       "__pycache__",
-      ".db",
-      ".sqlite",
-      ".sqlite3"
+      ".pytest_cache",
+      ".mypy_cache",
+      ".ruff_cache",
+      ".env",
+      ".env.*",
+      "*.db",
+      "*.sqlite",
+      "*.sqlite3"
     ]
   },
   "checkProfiles": {

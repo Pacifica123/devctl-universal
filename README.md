@@ -1,80 +1,49 @@
-# devctl universal v0.3
+# zapret2-gui Stage 0 workspace
 
-Project-agnostic pure-Python AI patch conveyor.
+This workspace is the bootstrap state for the Linux MVP of `zapret2-gui`.
 
-`devctl` applies AI-generated `patch.zip` archives to any project inside a workspace, runs declared checks, writes reports/logs, creates pre/post/failed snapshots, commits, pushes, and records state.
-
-## Workspace layout
+## Layout
 
 ```text
 workspace/
   .devctl/
-    workspace.json
-    state.json
-  project/
-    .git/
-    ... any project ...
-  patches/
-    patch_YYYYMMDD_HHMMSS_slug.zip
-  archives/
-    ... run artifacts ...
+    workspace.json      # active devctl config
+    state.json          # devctl run history
+  workspace.json        # human-readable mirror of the active config
+  devctl.py             # project-agnostic patch conveyor
+  project/              # Git repository for zapret2-gui sources/docs
+  patches/              # incoming patch zips
+  archives/             # source anchors, devctl snapshots, run reports
 ```
 
-## Bootstrap
+## Stage 0 rule
+
+Future project changes should be delivered as patch zips in `patches/` and applied with:
 
 ```bash
-cd /path/to/workspace
-python3 devctl.py init --project ./project
-python3 devctl.py status
+python3 devctl.py plan
+python3 devctl.py start
 ```
 
-`init` creates `.devctl/workspace.json`, `patches/`, `archives/`, and an empty state registry.
+Every patch proposal should explicitly answer: how does this relate to the real source anchor in `archives/zapret-main.zip`?
 
-## Read-only commands
+## Current bootstrap decisions
+
+- `archives/zapret-main.zip` is the mandatory product/source anchor.
+- `archives/docs.zip` and `archives/reference/*` are supplemental references.
+- `project/` is already initialized as a Git repository on branch `main`.
+- `devctl start` is intended as the magic button: apply patch, run checks, commit, and push.
+- Use `python3 devctl.py start --no-push` only for explicit local/debug runs.
+- `.devctl/workspace.json` owns workspace-level Git policy (`autoCommit`, `autoPush`, remote, branch/up-to-date rules).
+
+## Useful commands
 
 ```bash
 python3 devctl.py status
 python3 devctl.py inspect
-python3 devctl.py inspect patches/patch_20260505_120000_demo.zip
 python3 devctl.py plan
-```
-
-`inspect` and `plan` never modify the project.
-
-## Run conveyor
-
-```bash
 python3 devctl.py start
+cd project && git status -sb
 ```
 
-The current v0.3 flow:
-
-1. discover workspace/project;
-2. find the latest unapplied patch zip;
-3. validate `manifest.json` and zip paths;
-4. check Git preflight;
-5. create pre-archive;
-6. apply deletions and file overlay;
-7. run manifest checks;
-8. commit/push according to manifest;
-9. create post/failed archive;
-10. write report and update `.devctl/state.json`.
-
-## Patch zip format
-
-```text
-patch_YYYYMMDD_HHMMSS_slug.zip
-  manifest.json
-  files/
-    path/inside/project.ext
-  README.patch.md   optional
-```
-
-See `docs/patch-manifest.example.json`.
-
-## Notes
-
-- Pure Python standard library only.
-- Paths in manifest must be POSIX-style relative paths.
-- Dangerous paths such as `.git`, `.devctl`, `node_modules`, and `target` are blocked for patch writes/deletions.
-- `devctl` no longer knows anything about `p2p_planner`; the project is selected through `.devctl/workspace.json`.
+See `project/docs/STAGE0_EXECUTION_REPORT.md` and `project/docs/STAGE0_POSTDESIGN.md` for the executed Stage 0 design decisions.

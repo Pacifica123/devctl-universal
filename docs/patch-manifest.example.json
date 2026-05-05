@@ -23,11 +23,9 @@
     }
   ],
   "commit": {
-    "enabled": true,
     "message": "chore: apply demo universal patch"
   },
   "push": {
-    "enabled": false,
     "remote": "origin",
     "branch": "main"
   },

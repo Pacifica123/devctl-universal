@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "projectDir": "project",
+  "patchesDir": "patches",
+  "archivesDir": "archives",
+  "git": {
+    "enabled": true,
+    "remote": "origin",
+    "requireClean": true,
+    "requireUpToDate": false,
+    "bootstrapNote": "Set requireUpToDate=true after a real remote exists and branch policy is chosen.",
+    "autoCommit": true,
+    "autoPush": true
+  },
+  "archive": {
+    "exclude": [
+      ".git",
+      "node_modules",
+      "target",
+      "dist",
+      "build",
+      "coverage",
+      "__pycache__",
+      "logs",
+      "tmp",
+      ".pytest_cache",
+      ".mypy_cache",
+      ".ruff_cache",
+      ".env",
+      ".env.*",
+      "*.sqlite",
+      "*.sqlite3",
+      "*.db"
+    ]
+  },
+  "checkProfiles": {
+    "default": []
+  },
+  "stage0": {
+    "sourceAnchor": "archives/zapret-main.zip",
+    "referenceDocsArchive": "archives/docs.zip",
+    "referenceWrapper": "archives/reference/zapret2_strategy_wrapper.py",
+    "rule": "Every future project change should arrive as a patch zip in patches/ and mention source alignment against zapret-main.zip."
+  }
+}
