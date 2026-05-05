@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "projectDir": "project",
+  "patchesDir": "patches",
+  "archivesDir": "archives",
+  "git": {
+    "enabled": true,
+    "remote": "origin",
+    "requireClean": true,
+    "requireUpToDate": true
+  },
+  "archive": {
+    "exclude": [
+      ".git",
+      "node_modules",
+      "target",
+      "dist",
+      "build",
+      "coverage",
+      "__pycache__",
+      ".db",
+      ".sqlite",
+      ".sqlite3"
+    ]
+  },
+  "checkProfiles": {
+    "default": []
+  }
+}

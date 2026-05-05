@@ -1,0 +1,50 @@
+{
+  "formatVersion": 1,
+  "patchId": "2026-05-05-demo-change",
+  "title": "Demo project-agnostic change",
+  "summary": "Shows the universal devctl patch format.",
+  "kind": "tooling",
+  "createdAt": "2026-05-05T12:00:00Z",
+  "base": {
+    "branch": "main",
+    "expectedHead": null
+  },
+  "apply": {
+    "filesRoot": "files",
+    "delete": []
+  },
+  "checks": [
+    {
+      "name": "Python syntax",
+      "cwd": ".",
+      "command": "python3 -m compileall .",
+      "requiredCommands": ["python3"],
+      "timeoutSeconds": 120
+    }
+  ],
+  "commit": {
+    "enabled": true,
+    "message": "chore: apply demo universal patch"
+  },
+  "push": {
+    "enabled": false,
+    "remote": "origin",
+    "branch": "main"
+  },
+  "archive": {
+    "nameSlug": "demo-change",
+    "exclude": [
+      ".git/",
+      "node_modules/",
+      "target/",
+      "dist/",
+      "build/",
+      "coverage/",
+      "__pycache__/",
+      ".env",
+      ".env.*",
+      "*.sqlite",
+      "*.db"
+    ]
+  }
+}
