@@ -40,6 +40,7 @@
     "sourceAnchor": "archives/zapret-main.zip",
     "referenceDocsArchive": "archives/docs.zip",
     "referenceWrapper": "archives/reference/zapret2_strategy_wrapper.py",
-    "rule": "Every future project change should arrive as a patch zip in patches/ and mention source alignment against zapret-main.zip."
+    "rule": "Каждое будущее изменение проекта должно приходить zip-патчем в patches/ и явно описывать согласование с исходным якорем zapret-main.zip.",
+    "sourceAnchorNote": "Источник правды для продукта; патчи должны объяснять, как они соотносятся с этим архивом."
   }
 }

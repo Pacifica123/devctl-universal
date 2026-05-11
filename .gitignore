@@ -1,0 +1,23 @@
+# Python / devctl generated files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environment / secrets
+.env
+.env.*
+
+# Local databases
+*.sqlite
+*.sqlite3
+*.db
+
+# Build and dependency outputs
+dist/
+build/
+coverage/
+target/
+node_modules/

@@ -1,22 +1,22 @@
 # devctl universal v0.4
 
-Project-agnostic pure-Python AI patch conveyor.
+Проектно-независимый конвейер применения ИИ-патчей на чистом Python.
 
-`devctl` applies AI-generated patch archives to a project inside a workspace, runs declared checks, writes reports/logs, creates pre/post/failed snapshots, commits, pushes, and records state.
+`devctl` применяет архивы патчей к проекту внутри рабочей области, запускает объявленные проверки, пишет отчёты и логи, создаёт снимки состояния до/после/при ошибке, делает commit, выполняет push и записывает результат в реестр состояния.
 
-## Core idea
+## Главная идея
 
-`devctl start` is the magic button:
+`devctl start` — это «волшебная кнопка»:
 
 ```text
-apply latest unapplied patch -> run checks -> commit -> push
+применить последний неприменённый патч -> выполнить проверки -> commit -> push
 ```
 
-Patch manifests describe the patch content and checks. They should not be used as the normal control surface for whether the conveyor commits or pushes. A manifest may still provide a commit message or push target, but the default workflow is owned by `devctl` and the workspace.
+Манифест патча описывает содержимое патча и проверки. Он не должен быть обычной поверхностью управления тем, будет ли конвейер делать commit или push. Манифест может подсказать commit-сообщение или цель push, но базовым процессом управляют сам `devctl` и конфигурация рабочей области.
 
-Use `devctl start --no-push` only for explicit local-only/debug runs.
+`devctl start --no-push` используйте только для явных локальных или отладочных запусков.
 
-## Workspace layout
+## Структура рабочей области
 
 ```text
 workspace/
@@ -25,11 +25,11 @@ workspace/
     state.json
   project/
     .git/
-    ... any project ...
+    ... любой проект ...
   patches/
-    YYYY-MM-DD-stageN-title.devctl.patch.zip
+    patch_YYYYMMDD_HHMMSS_stageN_title.zip
   archives/
-    ... run artifacts ...
+    ... артефакты запусков ...
 ```
 
 ## Bootstrap
@@ -40,48 +40,48 @@ python3 devctl.py init --project ./project
 python3 devctl.py status
 ```
 
-`init` creates `.devctl/workspace.json`, `patches/`, `archives/`, and an empty state registry.
+`init` создаёт `.devctl/workspace.json`, каталоги `patches/`, `archives/` и пустой реестр состояния.
 
-## Read-only commands
+## Команды только для чтения
 
 ```bash
 python3 devctl.py status
 python3 devctl.py inspect
-python3 devctl.py inspect patches/2026-05-05-stage2-config-parser-patcher-v2.devctl.patch.zip
+python3 devctl.py inspect patches/patch_20260505_120000_stage2_config_parser.zip
 python3 devctl.py plan
 ```
 
-`inspect` and `plan` never modify the project.
+`inspect` и `plan` никогда не изменяют проект.
 
-## Run conveyor
+## Запуск конвейера
 
 ```bash
 python3 devctl.py start
 ```
 
-The v0.4 default flow:
+Поток v0.4:
 
-1. discover workspace/project;
-2. find the latest unapplied patch zip;
-3. validate `manifest.json` and zip paths;
-4. check Git preflight and push target;
-5. create pre-archive;
-6. apply deletions and file overlay;
-7. run manifest checks;
-8. commit after green checks;
-9. push after successful commit;
-10. create post/failed archive;
-11. write report and update `.devctl/state.json`.
+1. обнаружить рабочую область и проект;
+2. найти последний неприменённый zip-патч;
+3. проверить `manifest.json` и безопасность путей внутри zip;
+4. выполнить предзапусковые проверки Git и push-цели;
+5. создать pre-архив проекта;
+6. применить удаления и наложить файлы из `files/`;
+7. выполнить проверки из манифеста;
+8. создать commit после зелёных проверок;
+9. выполнить push после успешного commit;
+10. создать post-архив или failed-архив;
+11. записать отчёт и обновить `.devctl/state.json`.
 
-Local-only escape hatch:
+Локальный аварийный/отладочный режим:
 
 ```bash
 python3 devctl.py start --no-push
 ```
 
-## Git policy
+## Политика Git
 
-Workspace defaults:
+Типовые настройки рабочей области:
 
 ```json
 {
@@ -96,29 +96,40 @@ Workspace defaults:
 }
 ```
 
-Policy priority:
+Приоритет политики:
 
-1. `devctl start --no-push` disables only the push step for a deliberate local/debug run.
-2. `.devctl/workspace.json` owns the default workflow policy.
-3. `manifest.commit.message`, `manifest.push.remote`, and `manifest.push.branch` may provide metadata/target.
-4. `manifest.commit.enabled=false` and `manifest.push.enabled=false` are ignored by normal `start`, with a warning, because the conveyor default is commit+push after checks.
+1. `devctl start --no-push` отключает только шаг push для осознанного локального/отладочного запуска.
+2. `.devctl/workspace.json` владеет политикой рабочего процесса по умолчанию.
+3. `manifest.commit.message`, `manifest.push.remote` и `manifest.push.branch` могут дать метаданные и цель.
+4. `manifest.commit.enabled=false` и `manifest.push.enabled=false` игнорируются обычным `start` с предупреждением, потому что конвейер по умолчанию делает commit+push после зелёных проверок.
 
-## Patch zip format
+## Формат zip-патча
 
 ```text
-YYYY-MM-DD-stageN-title.devctl.patch.zip
+patch_YYYYMMDD_HHMMSS_stageN_title.zip
   manifest.json
   files/
     path/inside/project.ext
-  PATCH_SUMMARY.md      optional
-  reports/              optional
+  PATCH_SUMMARY.md      # опционально
+  reports/              # опционально
 ```
 
-See `docs/patch-manifest.example.json`.
+См. `docs/patch-manifest.example.json`.
 
-## Notes
+## Предохранители и ограничения
 
-- Pure Python standard library only.
-- Paths in manifest must be POSIX-style relative paths.
-- Dangerous paths such as `.git`, `.devctl`, `node_modules`, `target`, `__pycache__`, and `*.pyc` are blocked for patch writes/deletions or commits.
-- `devctl` is project-agnostic; the project is selected through `.devctl/workspace.json`.
+- Используется только стандартная библиотека Python.
+- Пути в манифесте должны быть относительными POSIX-путями.
+- Опасные пути вроде `.git`, `.devctl`, `node_modules`, `target`, `__pycache__` и `*.pyc` блокируются для рискованных операций записи/удаления/commit.
+- `.env` и `.env.*` не копируются из патчей и исключаются из архивов.
+- `devctl` проектно-независим: проект выбирается через `.devctl/workspace.json`.
+- Снимки `pre/post/failed` нужны не для релиза, а для диагностики и воспроизводимости.
+
+## Практическая философия
+
+`devctl` полезен как дисциплина разработки с ИИ:
+
+- ИИ не «правит всё подряд», а упаковывает изменения в патч.
+- Человек или автомат запускает один понятный конвейер.
+- Каждый запуск оставляет проверяемый след: hash патча, отчёт, логи, Git-коммит и архив состояния.
+- Ошибка не прячется: рабочее дерево остаётся для анализа, а отчёт показывает, где оборвался процесс.

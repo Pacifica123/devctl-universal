@@ -1,8 +1,8 @@
 {
   "formatVersion": 1,
   "patchId": "2026-05-05-demo-change",
-  "title": "Demo project-agnostic change",
-  "summary": "Shows the universal devctl patch format.",
+  "title": "Демонстрационное проектно-независимое изменение",
+  "summary": "Показывает универсальный формат патча devctl.",
   "kind": "tooling",
   "createdAt": "2026-05-05T12:00:00Z",
   "base": {
@@ -15,15 +15,17 @@
   },
   "checks": [
     {
-      "name": "Python syntax",
+      "name": "Проверка синтаксиса Python без генерации __pycache__",
       "cwd": ".",
-      "command": "python3 -m compileall .",
-      "requiredCommands": ["python3"],
+      "command": "python3 -c \"import ast,pathlib; ast.parse(pathlib.Path('devctl.py').read_text(encoding='utf-8'), filename='devctl.py')\"",
+      "requiredCommands": [
+        "python3"
+      ],
       "timeoutSeconds": 120
     }
   ],
   "commit": {
-    "message": "chore: apply demo universal patch"
+    "message": "chore: применить демонстрационный universal-патч"
   },
   "push": {
     "remote": "origin",

@@ -1,49 +1,81 @@
-# zapret2-gui Stage 0 workspace
+# devctl universal — конвейер ИИ-патчей
 
-This workspace is the bootstrap state for the Linux MVP of `zapret2-gui`.
+Этот репозиторий содержит минимальный универсальный инструмент `devctl`: безопасную «конвейерную ленту» для применения патчей, подготовленных ИИ или человеком. Его цель — превратить разработку в повторяемый поток: взять следующий патч, проверить его, применить, снова проверить, зафиксировать результат в Git, отправить изменения и оставить полный след в архивах/отчётах.
 
-## Layout
+## Философия
+
+`devctl start` задуман как «волшебная кнопка» разработки:
+
+```text
+найти последний неприменённый patch.zip -> проверить манифест -> сделать снимок до изменений -> применить файлы -> выполнить проверки -> commit -> push -> сделать снимок после изменений -> записать отчёт
+```
+
+Манифест патча описывает содержимое и проверки. Политика рабочего процесса живёт в `.devctl/workspace.json`: именно рабочая область решает, нужно ли требовать чистое дерево, делать commit и push. Это защищает проект от случайного изменения правил внутри самого патча.
+
+## Структура рабочей области
 
 ```text
 workspace/
   .devctl/
-    workspace.json      # active devctl config
-    state.json          # devctl run history
-  workspace.json        # human-readable mirror of the active config
-  devctl.py             # project-agnostic patch conveyor
-  project/              # Git repository for zapret2-gui sources/docs
-  patches/              # incoming patch zips
-  archives/             # source anchors, devctl snapshots, run reports
+    workspace.json      # активная конфигурация devctl
+    state.json          # журнал запусков и применённых патчей
+  workspace.json        # человекочитаемое зеркало конфигурации, если нужно
+  devctl.py             # проектно-независимый конвейер патчей
+  project/              # Git-репозиторий с исходниками и документацией продукта
+  patches/              # входящие patch.zip
+  archives/             # снимки до/после/ошибки, логи и отчёты запусков
 ```
 
-## Stage 0 rule
+## Базовое правило Stage 0
 
-Future project changes should be delivered as patch zips in `patches/` and applied with:
+Все будущие изменения проекта должны приходить в виде zip-патчей в `patches/` и применяться командой:
 
 ```bash
 python3 devctl.py plan
 python3 devctl.py start
 ```
 
-Every patch proposal should explicitly answer: how does this relate to the real source anchor in `archives/zapret-main.zip`?
+Каждое предложение патча должно явно отвечать на вопрос: как это изменение связано с реальным исходным якорем проекта в `archives/zapret-main.zip`?
 
-## Current bootstrap decisions
+## Текущие решения bootstrap-этапа
 
-- `archives/zapret-main.zip` is the mandatory product/source anchor.
-- `archives/docs.zip` and `archives/reference/*` are supplemental references.
-- `project/` is already initialized as a Git repository on branch `main`.
-- `devctl start` is intended as the magic button: apply patch, run checks, commit, and push.
-- Use `python3 devctl.py start --no-push` only for explicit local/debug runs.
-- `.devctl/workspace.json` owns workspace-level Git policy (`autoCommit`, `autoPush`, remote, branch/up-to-date rules).
+- `archives/zapret-main.zip` — обязательный продуктовый/исходный якорь.
+- `archives/docs.zip` и `archives/reference/*` — дополнительные справочные материалы.
+- `project/` должен быть Git-репозиторием на ветке `main` или другой ветке, выбранной политикой рабочей области.
+- `devctl start` — основная кнопка: применить патч, выполнить проверки, создать commit и сделать push.
+- `python3 devctl.py start --no-push` используется только для явных локальных или отладочных запусков.
+- `.devctl/workspace.json` управляет Git-политикой рабочей области: `autoCommit`, `autoPush`, remote, branch и требование актуальности ветки.
 
-## Useful commands
+## Полезные команды
 
 ```bash
-python3 devctl.py status
-python3 devctl.py inspect
-python3 devctl.py plan
-python3 devctl.py start
+python3 devctl.py status   # показать состояние рабочей области, Git и очереди патчей
+python3 devctl.py inspect  # посмотреть последний patch.zip без изменения файлов
+python3 devctl.py plan     # dry-run план применения патча
+python3 devctl.py start    # выполнить конвейер применения
 cd project && git status -sb
 ```
 
-See `project/docs/STAGE0_EXECUTION_REPORT.md` and `project/docs/STAGE0_POSTDESIGN.md` for the executed Stage 0 design decisions.
+## Формат патча
+
+```text
+patch_YYYYMMDD_HHMMSS_slug.zip
+  manifest.json
+  files/
+    path/inside/project.ext
+  PATCH_SUMMARY.md      # опционально
+  reports/              # опционально
+```
+
+Минимальная идея: всё, что лежит в `files/`, накладывается поверх проекта, а `manifest.json` описывает метаданные, удаления, проверки, commit-сообщение и целевой push.
+
+## Предохранители
+
+- Патч должен иметь корректный `manifest.json`.
+- Пути внутри архива обязаны быть относительными POSIX-путями.
+- Небезопасные каталоги вроде `.git`, `node_modules`, `target`, `__pycache__` и секретные `.env*` защищены от опасных операций.
+- Перед применением проверяется чистота Git-дерева.
+- До и после запуска создаются snapshot-архивы проекта.
+- При ошибке рабочее дерево оставляется для диагностики, а отчёт объясняет, что случилось.
+
+См. также подробную документацию в `docs/devctl-universal-v0.3-README.md` и примеры манифеста/рабочей области в `docs/`.
