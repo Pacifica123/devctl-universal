@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "projectDir": "project",
+  "projectDir": ".",
   "patchesDir": "patches",
   "archivesDir": "archives",
   "git": {
@@ -10,7 +10,8 @@
     "requireUpToDate": false,
     "bootstrapNote": "Set requireUpToDate=true after a real remote exists and branch policy is chosen.",
     "autoCommit": true,
-    "autoPush": true
+    "autoPush": true,
+    "branch": "main"
   },
   "archive": {
     "exclude": [

@@ -12,6 +12,30 @@
 
 Манифест патча описывает содержимое и проверки. Политика рабочего процесса живёт в `.devctl/workspace.json`: именно рабочая область решает, нужно ли требовать чистое дерево, делать commit и push. Это защищает проект от случайного изменения правил внутри самого патча.
 
+
+## Установка как CLI
+
+Начиная с v0.5 `devctl` можно поставить как обычную пользовательскую Linux-команду:
+
+```bash
+python3 devctl.py self install --with-completions
+# или
+./install.sh
+```
+
+После этого доступны:
+
+```bash
+devctl --version
+devctl -w /path/to/workspace status
+devctl -w /path/to/workspace plan
+devctl -w /path/to/workspace start
+devctl completion bash
+devctl self update --with-completions
+```
+
+Для постоянного выбора рабочей области можно задать `DEVCTL_WORKSPACE=/path/to/workspace`. Подробности — в `docs/release-cli.md`.
+
 ## Структура рабочей области
 
 ```text
