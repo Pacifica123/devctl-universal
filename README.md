@@ -15,7 +15,7 @@
 
 ## Установка как CLI
 
-Начиная с v0.5 `devctl` можно поставить как обычную пользовательскую Linux-команду:
+Начиная с v0.5 `devctl` можно поставить как обычную пользовательскую Linux-команду, а v0.5.1 добавляет метаданные установки для нормального обновления из исходного репозитория:
 
 ```bash
 python3 devctl.py self install --with-completions
@@ -31,10 +31,10 @@ devctl -w /path/to/workspace status
 devctl -w /path/to/workspace plan
 devctl -w /path/to/workspace start
 devctl completion bash
-devctl self update --with-completions
+devctl self update
 ```
 
-Для постоянного выбора рабочей области можно задать `DEVCTL_WORKSPACE=/path/to/workspace`. Подробности — в `docs/release-cli.md`.
+Для постоянного выбора рабочей области можно задать `DEVCTL_WORKSPACE=/path/to/workspace`. При установке с completions devctl записывает `~/.local/share/devctl/install.json`, поэтому последующий `devctl self update` знает, из какого `devctl.py` обновлять управляемую копию, и автоматически освежает ранее установленные completion-файлы. Подробности — в `docs/release-cli.md`.
 
 ## Структура рабочей области
 

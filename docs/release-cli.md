@@ -1,6 +1,6 @@
 # devctl как релизная CLI-утилита
 
-Цель v0.5 — пользоваться `devctl` как обычной Linux-командой, а не как локальным `python3 devctl.py` из конкретной папки.
+Цель v0.5+ — пользоваться `devctl` как обычной Linux-командой, а не как локальным `python3 devctl.py` из конкретной папки.
 
 ## Установка для пользователя
 
@@ -16,7 +16,7 @@ python3 devctl.py self install --with-completions
 ./install.sh
 ```
 
-По умолчанию команда `devctl` ставится в `~/.local/bin/devctl`, а управляемая копия ядра — в `~/.local/share/devctl/devctl.py`.
+По умолчанию команда `devctl` ставится в `~/.local/bin/devctl`, управляемая копия ядра — в `~/.local/share/devctl/devctl.py`, а метаданные установки — в `~/.local/share/devctl/install.json`. Метаданные запоминают исходный `devctl.py`, Git-корень источника и список установленных completion-оболочек.
 
 Если `~/.local/bin` ещё не в `PATH`, добавь в профиль оболочки:
 
@@ -33,23 +33,28 @@ devctl self info
 
 ## Обновление установленной утилиты
 
-После применения патча к репозиторию devctl обнови установленную копию одной командой из каталога свежего исходника:
+После применения патча к репозиторию devctl обнови установленную копию:
 
 ```bash
-python3 devctl.py self update --with-completions
+cd /path/to/devctl-repo
+devctl self update
 ```
 
-Если команда `devctl` уже указывает на свежий файл, можно выполнить:
+Если установка уже записала `~/.local/share/devctl/install.json`, то `devctl self update` можно запускать из любого каталога: он возьмёт `sourcePath` из метаданных и автоматически перезапишет ранее установленные completion-файлы.
+
+Для первого перехода со старой v0.5 без метаданных или для нестандартной раскладки можно явно указать источник:
 
 ```bash
-devctl self update --with-completions
+devctl self update --source /path/to/devctl.py --with-completions
 ```
 
-Для нестандартной раскладки:
+Если нужно перед копированием подтянуть исходный Git-репозиторий:
 
 ```bash
-devctl self update --source /path/to/devctl.py
+devctl self update --pull-source
 ```
+
+`--pull-source` выполняет `git fetch --all --prune` и `git pull --ff-only` в Git-репозитории источника, поэтому не создаёт merge-коммитов и падает на конфликтных/не fast-forward обновлениях.
 
 ## Работа с разными workspace
 
@@ -96,14 +101,21 @@ devctl self install-completions --shell auto
 - Zsh: `~/.local/share/zsh/site-functions/_devctl`
 - Fish: `~/.config/fish/completions/devctl.fish`
 
-На Arch/KDE bash completion обычно подхватывается после нового shell-сеанса, если установлен пакет `bash-completion`. Для zsh может потребоваться добавить пользовательский каталог в `fpath` до `compinit`, например:
+Факт наличия файла ещё не означает, что shell его загрузил. `devctl self info` теперь печатает подсказки по активации. Для zsh на Arch/KDE обычно нужно добавить пользовательский каталог в `fpath` до `compinit`:
 
 ```zsh
 fpath=("$HOME/.local/share/zsh/site-functions" $fpath)
 autoload -Uz compinit && compinit
 ```
 
-Completion не хранит вручную продублированный список команд: shell вызывает `devctl __complete`, а тот строит подсказки по текущему argparse-парсеру. Поэтому новые подкоманды и флаги будут появляться в completion после обновления devctl.
+После изменения `.zshrc` открой новый терминал или выполни эти строки в текущей сессии. Проверка генератора без shell-интеграции:
+
+```bash
+devctl __complete --position 1 bash -- devctl -
+devctl __complete --position 1 bash -- devctl st
+```
+
+Completion не хранит вручную продублированный список команд: shell вызывает `devctl __complete`, а тот строит подсказки по текущему argparse-парсеру. Поэтому новые подкоманды и флаги будут появляться в completion после обновления devctl; начиная с v0.5.1 `self update` также освежает ранее установленные completion-файлы.
 
 ## Удаление пользовательской установки
 
