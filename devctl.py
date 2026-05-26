@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-devctl v0.6.2 — проектно-независимый конвейер применения ИИ-патчей на чистом Python.
+devctl v0.6.3 — проектно-независимый конвейер применения ИИ-патчей на чистом Python.
 
 Базовый поток конвейера: применить патч -> выполнить проверки -> создать коммит -> отправить в remote.
 
@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-DEVCTL_VERSION = "0.6.2"
+DEVCTL_VERSION = "0.6.3"
 STATE_VERSION = 1
 DEFAULT_PROJECT_DIR_NAME = "project"
 DEFAULT_PATCHES_DIR_NAME = "patches"
@@ -1665,26 +1665,57 @@ def new_changes_after_checks(after_apply: str, after_checks: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def dangerous_git_changes(status_text: str) -> list[str]:
+def is_dangerous_git_path(relative_posix: str) -> bool:
+    normalized = relative_posix.replace("\\", "/")
+    parts = set(normalized.split("/"))
+    name = normalized.split("/")[-1]
+    lower = normalized.lower()
+    return (
+        name == ".env"
+        or name.startswith(".env.")
+        or bool(parts & DANGEROUS_GIT_PATH_PARTS)
+        or lower.endswith(DANGEROUS_GIT_PATH_SUFFIXES)
+    )
+
+
+def is_deletion_only_git_status(code: str) -> bool:
+    """Return True for plain tracked-file deletions in git porcelain v1.
+
+    Devctl must still block generated/cache additions, modifications, renames,
+    copies and untracked files.  A plain ``D`` in either porcelain column is
+    different: it means an already tracked path is being removed from Git,
+    which is exactly the desired repository-hygiene outcome after bytecode
+    auto-cleanup.
+    """
+    return code in {" D", "D "}
+
+
+def split_dangerous_git_changes(status_text: str) -> tuple[list[str], list[str]]:
     dangerous: list[str] = []
+    allowed_cleanup_deletions: list[str] = []
     for line in status_text.splitlines():
         if not line.strip() or len(line) < 4:
             continue
+        code = line[:2]
         path_text = line[3:].strip()
-        # Rename lines have "old -> new". Check both sides.
+        # Rename/copy lines have "old -> new". Check both sides, but never
+        # treat them as deletion-only cleanup because they introduce or move
+        # paths and therefore must stay under the strict guard.
         candidates = [part.strip() for part in path_text.split(" -> ")]
         for candidate in candidates:
             normalized = candidate.replace("\\", "/")
-            parts = set(normalized.split("/"))
-            name = normalized.split("/")[-1]
-            lower = normalized.lower()
-            if name == ".env" or name.startswith(".env."):
+            if not is_dangerous_git_path(normalized):
+                continue
+            if is_deletion_only_git_status(code) and is_python_bytecode_artifact(normalized):
+                allowed_cleanup_deletions.append(normalized)
+            else:
                 dangerous.append(normalized)
-            elif parts & DANGEROUS_GIT_PATH_PARTS:
-                dangerous.append(normalized)
-            elif lower.endswith(DANGEROUS_GIT_PATH_SUFFIXES):
-                dangerous.append(normalized)
-    return sorted(set(dangerous))
+    return sorted(set(dangerous)), sorted(set(allowed_cleanup_deletions))
+
+
+def dangerous_git_changes(status_text: str) -> list[str]:
+    dangerous, _allowed_cleanup_deletions = split_dangerous_git_changes(status_text)
+    return dangerous
 
 
 def commit_and_push(ctx: RunContext) -> None:
@@ -1695,7 +1726,12 @@ def commit_and_push(ctx: RunContext) -> None:
         ctx.warnings.append("manifest.commit.enabled=false проигнорирован; по умолчанию devctl делает коммит после зелёных проверок")
 
     current_status = git_status_porcelain(project_root)
-    dangerous = dangerous_git_changes(current_status)
+    dangerous, allowed_cleanup_deletions = split_dangerous_git_changes(current_status)
+    if allowed_cleanup_deletions:
+        ctx.warnings.append(
+            "Разрешено cleanup-удаление tracked generated/cache файлов: "
+            + ", ".join(allowed_cleanup_deletions)
+        )
     if dangerous:
         raise DevctlError(
             "Отказ коммитить опасные сгенерированные/локальные файлы: " + ", ".join(dangerous)

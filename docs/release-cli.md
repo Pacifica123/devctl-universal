@@ -1,6 +1,6 @@
 # devctl как релизная CLI-утилита
 
-Цель v0.5+ — пользоваться `devctl` как обычной командой, а не как локальным `python devctl.py` из конкретной папки. v0.6.0 добавляет `reset` и User Test Space, а v0.6.1 — автоочистку Python bytecode/cache внутри `start` для ручного тестирования успешных снимков.
+Цель v0.5+ — пользоваться `devctl` как обычной командой, а не как локальным `python devctl.py` из конкретной папки. v0.6.0 добавляет `reset` и User Test Space, v0.6.1 — автоочистку Python bytecode/cache внутри `start`, а v0.6.3 — корректный commit deletion-only cleanup для tracked bytecode.
 
 ## Установка для пользователя
 
@@ -149,3 +149,9 @@ devctl self uninstall --with-completions --force
 ## Workspace upgrade
 
 `devctl init --upgrade` безопасно актуализирует существующий workspace после появления новых служебных папок и полей конфигурации. Команда создаёт недостающие `patches/`, `archives/`, `UserTestSpace/`, `.devctl/state.json` и дополняет `.devctl/workspace.json`, но не перезаписывает пользовательские пути и не трогает содержимое `project/`.
+
+## v0.6.3: tracked bytecode cleanup не блокирует commit
+
+`devctl start` теперь разрешает deletion-only изменения для уже tracked generated/cache путей, если автоочистка удалила старый `__pycache__/`, `*.pyc` или `*.pyo` из репозитория. Это устраняет конфликт, когда devctl сам очищал legacy bytecode, а затем commit-guard отказывался коммитить `D backend/tests/__pycache__/...pyc`.
+
+Строгая защита сохранена: добавления, модификации, переименования, копирования и untracked generated/cache пути (`A`, `M`, `R`, `C`, `??`) по-прежнему блокируются перед `git add -A`. В отчёте такое разрешённое удаление отображается как warning, чтобы пользователь видел, что вместе с патчем очищен ранее tracked мусор.
