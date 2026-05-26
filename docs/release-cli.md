@@ -1,6 +1,6 @@
 # devctl как релизная CLI-утилита
 
-Цель v0.5+ — пользоваться `devctl` как обычной Linux-командой, а не как локальным `python3 devctl.py` из конкретной папки.
+Цель v0.5+ — пользоваться `devctl` как обычной командой, а не как локальным `python devctl.py` из конкретной папки. v0.6.0 добавляет `reset` и User Test Space для ручного тестирования успешных снимков.
 
 ## Установка для пользователя
 
@@ -64,6 +64,7 @@ devctl self update --pull-source
 devctl -w ~/workspaces/my-product status
 devctl -w ~/workspaces/my-product plan
 devctl -w ~/workspaces/my-product start
+devctl -w ~/workspaces/my-product reset
 ```
 
 То же самое можно закрепить переменной окружения:
@@ -128,3 +129,11 @@ devctl self uninstall --with-completions
 ```bash
 devctl self uninstall --with-completions --force
 ```
+
+## v0.6.0: reset и User Test Space
+
+`devctl reset` выполняет из корня workspace аварийный откат `project/` через `git reset --hard <target>` и `git clean -fd`/`-fdx`. По умолчанию команда также пытается удалить последний failed patch.zip из `patches/`, если такой запуск записан в `.devctl/state.json`. Для сохранения архива патча используй `--keep-patch`; для явного удаления — `--delete-patch <name.zip>`.
+
+`devctl start` при failed checks или ошибке до создания локального commit теперь сначала сохраняет failed-архив, затем автоматически откатывает рабочее дерево. При `push_failed` auto-reset намеренно не выполняется, потому что локальный commit уже создан и его нужно разбирать отдельно.
+
+После успешного `start` свежий post-архив разворачивается в `UserTestSpace/<version>/project`. Это пространство предназначено для ручных запусков вроде `cargo run`, `npm install`, сборок GUI и других действий, создающих тяжёлые/грязные файлы. Старые папки UTS не удаляются автоматически.

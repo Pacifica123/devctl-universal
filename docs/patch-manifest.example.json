@@ -17,9 +17,9 @@
     {
       "name": "Проверка синтаксиса Python без генерации __pycache__",
       "cwd": ".",
-      "command": "python3 -c \"import ast,pathlib; ast.parse(pathlib.Path('devctl.py').read_text(encoding='utf-8'), filename='devctl.py')\"",
+      "command": "python -c \"import ast,pathlib; ast.parse(pathlib.Path('devctl.py').read_text(encoding='utf-8'), filename='devctl.py')\"",
       "requiredCommands": [
-        "python3"
+        "python"
       ],
       "timeoutSeconds": 120
     }
