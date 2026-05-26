@@ -32,7 +32,9 @@
       ".env.*",
       "*.sqlite",
       "*.sqlite3",
-      "*.db"
+      "*.db",
+      "*.pyc",
+      "*.pyo"
     ]
   },
   "checkProfiles": {

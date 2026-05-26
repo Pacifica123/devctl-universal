@@ -144,3 +144,8 @@ devctl self uninstall --with-completions --force
 `devctl start` теперь мягко игнорирует Python bytecode/cache, случайно попавший в patch payload: `__pycache__/`, `*.pyc`, `*.pyo`. Такие записи не копируются в `project/`, но фиксируются в отчёте как проигнорированные.
 
 После этапа применения и после проверок `start` дополнительно удаляет `__pycache__/`, `*.pyc`, `*.pyo` из `project/` перед вычислением Git status и перед commit. Это закрывает частый случай, когда Python-команды проверок создают локальный bytecode и devctl раньше отказывался коммитить из-за опасных сгенерированных файлов.
+
+
+## Workspace upgrade
+
+`devctl init --upgrade` безопасно актуализирует существующий workspace после появления новых служебных папок и полей конфигурации. Команда создаёт недостающие `patches/`, `archives/`, `UserTestSpace/`, `.devctl/state.json` и дополняет `.devctl/workspace.json`, но не перезаписывает пользовательские пути и не трогает содержимое `project/`.

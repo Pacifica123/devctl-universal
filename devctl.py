@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-devctl v0.6.1 — проектно-независимый конвейер применения ИИ-патчей на чистом Python.
+devctl v0.6.2 — проектно-независимый конвейер применения ИИ-патчей на чистом Python.
 
 Базовый поток конвейера: применить патч -> выполнить проверки -> создать коммит -> отправить в remote.
 
@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-DEVCTL_VERSION = "0.6.1"
+DEVCTL_VERSION = "0.6.2"
 STATE_VERSION = 1
 DEFAULT_PROJECT_DIR_NAME = "project"
 DEFAULT_PATCHES_DIR_NAME = "patches"
@@ -2057,6 +2057,7 @@ def build_status_payload(workspace_arg: str | None = None) -> tuple[dict[str, An
         "ok": True,
         "version": DEVCTL_VERSION,
         "workspace": workspace_to_json(workspace),
+        "workspaceConfig": workspace_config_upgrade_status(workspace),
         "git": git_status_to_json(workspace),
         "patches": {"count": 0, "latest": None, "items": []},
         "state": {
@@ -2112,6 +2113,15 @@ def status_command(args: argparse.Namespace | None = None) -> int:
     print(f"Каталог патчей:        {workspace.patches_dir} {'[нет]' if not workspace.patches_dir.is_dir() else ''}")
     print(f"Каталог архивов:       {workspace.archives_dir} {'[нет]' if not workspace.archives_dir.is_dir() else ''}")
     print(f"Каталог UTS:           {workspace.uts_dir} {'[нет]' if not workspace.uts_dir.is_dir() else ''}")
+    config_status = workspace_config_upgrade_status(workspace)
+    if config_status.get("upgradeAvailable"):
+        print("Конфигурация workspace: рекомендуется `devctl init --upgrade`")
+        missing = []
+        missing.extend(config_status.get("missingFields") or [])
+        missing.extend(config_status.get("missingArchiveExcludes") or [])
+        missing.extend(config_status.get("missingDirs") or [])
+        if missing:
+            print(f"Нужно добавить/создать: {', '.join(str(item) for item in missing)}")
 
     print_header("git")
     if not git_available():
@@ -2790,7 +2800,239 @@ def init_git_repository(project_root: Path, *, branch: str | None, remote_url: s
     return result
 
 
+
+def default_git_config(branch: str | None = None) -> dict[str, Any]:
+    config: dict[str, Any] = {
+        "enabled": True,
+        "autoCommit": True,
+        "autoPush": True,
+        "remote": "origin",
+        "requireClean": True,
+        "requireUpToDate": True,
+    }
+    if branch:
+        config["branch"] = str(branch)
+    return config
+
+
+def normalize_workspace_config_for_upgrade(
+    config: dict[str, Any],
+    *,
+    project_dir: str,
+    patches_dir: str,
+    archives_dir: str,
+    uts_dir: str,
+    branch: str | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Non-destructively add fields that new devctl versions expect.
+
+    The function preserves unknown/custom keys and only fills missing defaults or
+    augments archive exclusions. It never rewrites projectDir/patchesDir/etc. when
+    they already exist, which makes `devctl init --upgrade` safe for old workspaces.
+    """
+    upgraded = dict(config)
+    changes: list[str] = []
+
+    def ensure(key: str, value: Any) -> None:
+        if key not in upgraded or upgraded.get(key) in (None, ""):
+            upgraded[key] = value
+            changes.append(key)
+
+    ensure("version", 1)
+    ensure("projectDir", project_dir)
+    ensure("patchesDir", patches_dir)
+    ensure("archivesDir", archives_dir)
+    ensure("userTestSpaceDir", uts_dir)
+
+    git_config = upgraded.get("git")
+    if not isinstance(git_config, dict):
+        upgraded["git"] = default_git_config(branch)
+        changes.append("git")
+
+    archive_config = upgraded.get("archive")
+    if not isinstance(archive_config, dict):
+        archive_config = {}
+        upgraded["archive"] = archive_config
+        changes.append("archive")
+    exclude = archive_config.get("exclude")
+    if not isinstance(exclude, list):
+        exclude = []
+        archive_config["exclude"] = exclude
+        changes.append("archive.exclude")
+    required_excludes = [
+        "UserTestSpace",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        "*.pyc",
+        "*.pyo",
+    ]
+    existing = {str(item) for item in exclude}
+    for item in required_excludes:
+        if item not in existing:
+            exclude.append(item)
+            existing.add(item)
+            changes.append(f"archive.exclude:{item}")
+
+    profiles = upgraded.get("checkProfiles")
+    if not isinstance(profiles, dict):
+        upgraded["checkProfiles"] = {"default": []}
+        changes.append("checkProfiles")
+    elif "default" not in profiles:
+        profiles["default"] = []
+        changes.append("checkProfiles.default")
+
+    return upgraded, changes
+
+
+def workspace_config_upgrade_status(workspace: Workspace) -> dict[str, Any]:
+    config_path = workspace.state_dir / "workspace.json"
+    info: dict[str, Any] = {
+        "path": str(config_path),
+        "exists": config_path.is_file(),
+        "upgradeAvailable": False,
+        "missingFields": [],
+        "missingArchiveExcludes": [],
+        "missingDirs": [],
+        "error": None,
+    }
+    if not config_path.is_file():
+        info["upgradeAvailable"] = True
+        info["missingFields"] = [".devctl/workspace.json"]
+    else:
+        try:
+            config = read_json_file(config_path)
+            if not isinstance(config, dict):
+                raise DevctlError("workspace.json должен быть JSON-объектом")
+            missing_fields = [key for key in ("version", "projectDir", "patchesDir", "archivesDir", "userTestSpaceDir") if key not in config]
+            info["missingFields"] = missing_fields
+            archive = config.get("archive") if isinstance(config.get("archive"), dict) else {}
+            exclude = archive.get("exclude") if isinstance(archive, dict) else []
+            exclude_values = {str(item) for item in exclude} if isinstance(exclude, list) else set()
+            required = ["UserTestSpace", "__pycache__", ".pytest_cache", "*.pyc", "*.pyo"]
+            info["missingArchiveExcludes"] = [item for item in required if item not in exclude_values]
+        except Exception as exc:
+            info["error"] = str(exc)
+            info["upgradeAvailable"] = True
+    dirs = []
+    for label, path in (("patches", workspace.patches_dir), ("archives", workspace.archives_dir), ("UserTestSpace", workspace.uts_dir), (".devctl", workspace.state_dir)):
+        if not path.is_dir():
+            dirs.append(label)
+    if not workspace.state_file.exists():
+        dirs.append(".devctl/state.json")
+    info["missingDirs"] = dirs
+    if info["missingFields"] or info["missingArchiveExcludes"] or info["missingDirs"]:
+        info["upgradeAvailable"] = True
+    return info
+
+
+def upgrade_workspace_command(args: argparse.Namespace) -> int:
+    init_workspace_arg = getattr(args, "workspace", None) or getattr(args, "workspace_override", None)
+    workspace_root = expand_user_path(init_workspace_arg).resolve() if init_workspace_arg else Path.cwd().resolve()
+    state_dir = workspace_root / ".devctl"
+    config_path = state_dir / "workspace.json"
+    json_enabled = bool(getattr(args, "json", False))
+
+    payload: dict[str, Any] = {
+        "ok": False,
+        "version": DEVCTL_VERSION,
+        "mode": "upgrade",
+        "workspaceRoot": str(workspace_root),
+        "configPath": str(config_path),
+        "created": [],
+        "updatedFields": [],
+        "warnings": [],
+        "changed": False,
+    }
+
+    if not config_path.exists():
+        message = f"Конфигурация рабочей области не найдена: {config_path}. Для нового workspace используйте обычный `devctl init`."
+        payload["error"] = message
+        maybe_emit_json(json_enabled, payload)
+        raise DevctlError(message)
+
+    config = read_json_file(config_path)
+    if not isinstance(config, dict):
+        message = f"workspace.json должен быть JSON-объектом: {config_path}"
+        payload["error"] = message
+        maybe_emit_json(json_enabled, payload)
+        raise DevctlError(message)
+
+    project_dir_value = str(config.get("projectDir") or args.project or DEFAULT_PROJECT_DIR_NAME)
+    patches_dir_value = str(config.get("patchesDir") or args.patches or DEFAULT_PATCHES_DIR_NAME)
+    archives_dir_value = str(config.get("archivesDir") or args.archives or DEFAULT_ARCHIVES_DIR_NAME)
+    uts_dir_value = str(config.get("userTestSpaceDir") or getattr(args, "uts", DEFAULT_UTS_DIR_NAME) or DEFAULT_UTS_DIR_NAME)
+
+    upgraded_config, updated_fields = normalize_workspace_config_for_upgrade(
+        config,
+        project_dir=project_dir_value,
+        patches_dir=patches_dir_value,
+        archives_dir=archives_dir_value,
+        uts_dir=uts_dir_value,
+        branch=getattr(args, "branch", None),
+    )
+
+    workspace = discover_workspace_from_config(config_path) if not updated_fields else None
+    if workspace is None:
+        # Use the upgraded config before it is written to resolve newly introduced paths.
+        temp_path = config_path
+        temp_config = upgraded_config
+        project_root = resolve_workspace_path(workspace_root, temp_config.get("projectDir"), default=DEFAULT_PROJECT_DIR_NAME, key="projectDir")
+        patches_dir = resolve_workspace_path(workspace_root, temp_config.get("patchesDir"), default=DEFAULT_PATCHES_DIR_NAME, key="patchesDir")
+        archives_dir = resolve_workspace_path(workspace_root, temp_config.get("archivesDir"), default=DEFAULT_ARCHIVES_DIR_NAME, key="archivesDir")
+        uts_dir = resolve_workspace_path(workspace_root, temp_config.get("userTestSpaceDir"), default=DEFAULT_UTS_DIR_NAME, key="userTestSpaceDir")
+        workspace = Workspace(
+            project_root=project_root,
+            workspace_root=workspace_root,
+            patches_dir=patches_dir,
+            archives_dir=archives_dir,
+            uts_dir=uts_dir,
+            state_dir=state_dir,
+            state_file=state_dir / "state.json",
+        )
+
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    for path_to_create, label in ((workspace.patches_dir, "patches"), (workspace.archives_dir, "archives"), (workspace.uts_dir, "UserTestSpace"), (workspace.state_dir, ".devctl")):
+        existed = path_to_create.exists()
+        path_to_create.mkdir(parents=True, exist_ok=True)
+        if not existed:
+            payload["created"].append(label)
+
+    if getattr(args, "create_project", False):
+        existed = workspace.project_root.exists()
+        workspace.project_root.mkdir(parents=True, exist_ok=True)
+        if not existed:
+            payload["created"].append("project")
+    elif not workspace.project_root.exists():
+        payload["warnings"].append(f"каталог проекта отсутствует и не создавался: {workspace.project_root}")
+
+    if not workspace.state_file.exists():
+        write_json_file(workspace.state_file, {"version": STATE_VERSION, "runs": []})
+        payload["created"].append(".devctl/state.json")
+
+    if upgraded_config != config:
+        write_json_file(config_path, upgraded_config)
+        payload["changed"] = True
+    payload["updatedFields"] = updated_fields
+    payload["workspace"] = workspace_to_json(discover_workspace_from_config(config_path))
+    payload["ok"] = True
+
+    print_header("devctl init --upgrade")
+    print(f"Корень рабочей области: {workspace_root}")
+    print(f"Конфигурация:         {config_path}")
+    print(f"Обновление config:    {'да' if payload['changed'] else 'не требовалось'}")
+    print(f"Создано:              {', '.join(payload['created']) if payload['created'] else 'ничего'}")
+    print(f"Поля/исключения:      {', '.join(updated_fields) if updated_fields else 'уже актуальны'}")
+    print(f"Каталог UTS:          {workspace.uts_dir}")
+    for warning in payload.get("warnings") or []:
+        print(f"Предупреждение: {warning}")
+    maybe_emit_json(json_enabled, payload)
+    return 0
+
 def init_command(args: argparse.Namespace) -> int:
+    if getattr(args, "upgrade", False):
+        return upgrade_workspace_command(args)
     init_workspace_arg = getattr(args, "workspace", None) or getattr(args, "workspace_override", None)
     workspace_root = expand_user_path(init_workspace_arg).resolve() if init_workspace_arg else Path.cwd().resolve()
     project_path = Path(args.project).expanduser()
@@ -2843,16 +3085,7 @@ def init_command(args: argparse.Namespace) -> int:
             payload["created"].append("project")
 
     branch = getattr(args, "branch", None)
-    git_config = {
-        "enabled": True,
-        "autoCommit": True,
-        "autoPush": True,
-        "remote": "origin",
-        "requireClean": True,
-        "requireUpToDate": True,
-    }
-    if branch:
-        git_config["branch"] = str(branch)
+    git_config = default_git_config(branch)
 
     config = {
         "version": 1,
@@ -3705,13 +3938,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser._optionals.title = "параметры"
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="{init,status,inspect,plan,start,reset,completion,self}")
 
-    init = subparsers.add_parser("init", help="Создать .devctl/workspace.json, patches/ и archives/")
+    init = subparsers.add_parser("init", help="Создать или безопасно обновить структуру workspace")
     init.add_argument("--workspace", default=None, help="Корень рабочей области. По умолчанию текущий каталог.")
     init.add_argument("--project", default=DEFAULT_PROJECT_DIR_NAME, help="Каталог проекта относительно рабочей области или абсолютный путь.")
     init.add_argument("--patches", default=DEFAULT_PATCHES_DIR_NAME, help="Каталог патчей относительно рабочей области.")
     init.add_argument("--archives", default=DEFAULT_ARCHIVES_DIR_NAME, help="Каталог архивов относительно рабочей области.")
     init.add_argument("--uts", default=DEFAULT_UTS_DIR_NAME, help="Каталог User Test Space относительно рабочей области.")
     init.add_argument("--force", action="store_true", help="Перезаписать существующий .devctl/workspace.json")
+    init.add_argument("--upgrade", action="store_true", help="Безопасно актуализировать существующий workspace без перезаписи пользовательских путей")
     init.add_argument("--json", action="store_true", help="Вывести машинно-читаемый JSON")
     init.add_argument("--create-project", action="store_true", help="Создать каталог проекта, если его ещё нет")
     init.add_argument("--git-init", action="store_true", help="Инициализировать локальный Git-репозиторий в каталоге проекта")
