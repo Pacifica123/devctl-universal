@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-devctl v0.6.0 — проектно-независимый конвейер применения ИИ-патчей на чистом Python.
+devctl v0.6.1 — проектно-независимый конвейер применения ИИ-патчей на чистом Python.
 
 Базовый поток конвейера: применить патч -> выполнить проверки -> создать коммит -> отправить в remote.
 
@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-DEVCTL_VERSION = "0.6.0"
+DEVCTL_VERSION = "0.6.1"
 STATE_VERSION = 1
 DEFAULT_PROJECT_DIR_NAME = "project"
 DEFAULT_PATCHES_DIR_NAME = "patches"
@@ -68,6 +68,8 @@ RELEASE_EXE_PLACEHOLDER = "тут_был_экзешник.txt"
 ARCHIVE_SIZE_WARNING_BYTES = 100 * 1024 * 1024
 DANGEROUS_GIT_PATH_SUFFIXES = ARCHIVE_EXCLUDED_SUFFIXES + (".pyc", ".pyo")
 DANGEROUS_GIT_PATH_PARTS = {"node_modules", "target", ".git", "__pycache__", "patches", "archives", "arhives", "UserTestSpace"}
+PYTHON_BYTECODE_DIR_NAMES = {"__pycache__"}
+PYTHON_BYTECODE_SUFFIXES = (".pyc", ".pyo")
 
 
 class DevctlError(Exception):
@@ -175,6 +177,9 @@ class RunContext:
     git_status_after_checks: str = ""
     changes_introduced_by_checks: list[str] = field(default_factory=list)
     archive_size_warnings: list[str] = field(default_factory=list)
+    ignored_bytecode_files: list[str] = field(default_factory=list)
+    cleaned_bytecode_paths: list[str] = field(default_factory=list)
+    bytecode_cleanup_error: str | None = None
     auto_reset_performed: bool = False
     auto_reset_target: str | None = None
     auto_reset_clean_mode: str | None = None
@@ -1171,8 +1176,17 @@ def validate_patch_files_root(candidate: PatchCandidate, manifest: dict[str, Any
     except Exception as exc:
         raise InvalidPatchError(f"Не удалось проверить zip-архив патча: {exc}") from exc
     file_entries = [name for name in names if name != files_root and name.startswith(prefix) and not name.endswith("/")]
+    actionable_file_entries = []
+    for name in file_entries:
+        relative = name[len(prefix) :]
+        if not is_python_bytecode_artifact(relative):
+            actionable_file_entries.append(name)
     delete_entries = manifest.get("apply", {}).get("delete", [])
-    if not file_entries and not delete_entries:
+    if not actionable_file_entries and not delete_entries:
+        if file_entries:
+            raise InvalidPatchError(
+                f"В патче внутри {files_root!r} есть только Python bytecode/cache, который devctl игнорирует"
+            )
         raise InvalidPatchError(f"В патче нет файлов внутри {files_root!r} и нет записей на удаление")
     for name in names:
         if "\\" in name:
@@ -1216,6 +1230,65 @@ def should_exclude_from_archive(relative_posix: str, extra_excludes: Iterable[st
         if fnmatch.fnmatch(relative_posix, normalized):
             return True
     return False
+
+
+def is_python_bytecode_artifact(relative_posix: str) -> bool:
+    normalized = relative_posix.replace("\\", "/").strip("/")
+    if not normalized:
+        return False
+    parts = [part for part in normalized.split("/") if part]
+    if any(part in PYTHON_BYTECODE_DIR_NAMES for part in parts):
+        return True
+    return normalized.lower().endswith(PYTHON_BYTECODE_SUFFIXES)
+
+
+def clean_python_bytecode_artifacts(project_root: Path) -> list[str]:
+    """Delete Python bytecode/cache artifacts from the project tree.
+
+    This is intentionally conservative: only __pycache__ directories and
+    .pyc/.pyo files are removed, using pathlib/shutil only so it works on
+    Windows, Linux and macOS.
+    """
+    removed: list[str] = []
+    if not project_root.exists():
+        return removed
+
+    cache_dirs: list[Path] = []
+    bytecode_files: list[Path] = []
+    for root, dirs, files in os.walk(project_root):
+        root_path = Path(root)
+        for directory in dirs:
+            if directory in PYTHON_BYTECODE_DIR_NAMES:
+                cache_dirs.append(root_path / directory)
+        for filename in files:
+            if filename.lower().endswith(PYTHON_BYTECODE_SUFFIXES):
+                bytecode_files.append(root_path / filename)
+
+    for path in sorted(cache_dirs, key=lambda item: len(item.parts), reverse=True):
+        if path.exists():
+            shutil.rmtree(path)
+            removed.append(rel_display(path, project_root))
+
+    for path in sorted(bytecode_files):
+        if path.exists():
+            path.unlink()
+            removed.append(rel_display(path, project_root))
+
+    return sorted(set(removed))
+
+
+def clean_python_bytecode_for_start(ctx: RunContext, phase: str) -> None:
+    try:
+        removed = clean_python_bytecode_artifacts(ctx.workspace.project_root)
+    except Exception as exc:
+        ctx.bytecode_cleanup_error = str(exc)
+        ctx.warnings.append(f"Не удалось очистить Python bytecode/cache после этапа {phase}: {exc}")
+        return
+    if removed:
+        ctx.cleaned_bytecode_paths.extend(removed)
+        ctx.warnings.append(
+            f"Автоочистка Python bytecode/cache после этапа {phase}: удалено {len(removed)} объект(ов)."
+        )
 
 
 def unique_path(path: Path) -> Path:
@@ -1507,6 +1580,9 @@ def safe_copy_files(ctx: RunContext) -> None:
             parts = rel.split("/")
             if parts[0] == ".git" or ".git" in parts:
                 raise InvalidPatchError(f"Отказ копировать путь .git: {rel}")
+            if is_python_bytecode_artifact(rel):
+                ctx.ignored_bytecode_files.append(rel)
+                continue
             if parts[-1] == ".env" or parts[-1].startswith(".env."):
                 raise InvalidPatchError(f"Отказ копировать env-файл, похожий на секрет: {rel}")
             destination = safe_destination(project_root, rel, kind=f"zip entry {name!r}")
@@ -1716,6 +1792,18 @@ def report_lines(ctx: RunContext, finished_at: datetime) -> list[str]:
         lines.append(f"  - `{path}`\n")
     if len(ctx.deleted_paths) > 200:
         lines.append(f"  - ... ещё {len(ctx.deleted_paths) - 200}\n")
+    lines.append(f"- Проигнорировано Python bytecode/cache из patch payload: {len(ctx.ignored_bytecode_files)}\n")
+    for path in ctx.ignored_bytecode_files[:200]:
+        lines.append(f"  - `{path}`\n")
+    if len(ctx.ignored_bytecode_files) > 200:
+        lines.append(f"  - ... ещё {len(ctx.ignored_bytecode_files) - 200}\n")
+    lines.append(f"- Автоочистка Python bytecode/cache в project: {len(set(ctx.cleaned_bytecode_paths))}\n")
+    for path in sorted(set(ctx.cleaned_bytecode_paths))[:200]:
+        lines.append(f"  - `{path}`\n")
+    if len(set(ctx.cleaned_bytecode_paths)) > 200:
+        lines.append(f"  - ... ещё {len(set(ctx.cleaned_bytecode_paths)) - 200}\n")
+    if ctx.bytecode_cleanup_error:
+        lines.append(f"- Ошибка очистки Python bytecode/cache: `{ctx.bytecode_cleanup_error}`\n")
     lines.append("\n## Снимки статуса Git\n\n")
     lines.append("### Изменения после применения\n\n")
     lines.append("```text\n" + (ctx.git_status_after_apply or "<пусто>\n") + "```\n\n")
@@ -1832,6 +1920,9 @@ def update_state_from_context(ctx: RunContext) -> None:
         "badPatchDeleteError": ctx.bad_patch_delete_error,
         "utsProjectDir": rel_display(ctx.uts_project_dir, ctx.workspace.workspace_root) if ctx.uts_project_dir else None,
         "utsError": ctx.uts_error,
+        "ignoredBytecodeFiles": ctx.ignored_bytecode_files,
+        "cleanedBytecodePaths": sorted(set(ctx.cleaned_bytecode_paths)),
+        "bytecodeCleanupError": ctx.bytecode_cleanup_error,
     }
     append_run_state(ctx.workspace, record)
 
@@ -2182,6 +2273,9 @@ def start_result_payload(
             "patch": None,
             "errors": [] if not message else [message] if returncode else [],
             "warnings": [],
+            "ignoredBytecodeFiles": [],
+            "cleanedBytecodePaths": [],
+            "bytecodeCleanupError": None,
         }
     return {
         "ok": returncode == 0 and ctx.status in {"applied", "running", "noop"},
@@ -2207,6 +2301,9 @@ def start_result_payload(
         "utsError": ctx.uts_error,
         "copiedFiles": ctx.copied_files,
         "deletedPaths": ctx.deleted_paths,
+        "ignoredBytecodeFiles": ctx.ignored_bytecode_files,
+        "cleanedBytecodePaths": sorted(set(ctx.cleaned_bytecode_paths)),
+        "bytecodeCleanupError": ctx.bytecode_cleanup_error,
         "errors": ctx.errors,
         "warnings": ctx.warnings,
     }
@@ -2307,10 +2404,12 @@ def start_command(args: argparse.Namespace) -> int:
             ctx.applied_started = True
             apply_deletions(ctx)
             safe_copy_files(ctx)
+            clean_python_bytecode_for_start(ctx, "apply")
             ctx.git_status_after_apply = git_status_porcelain(workspace.project_root)
             write_log(ctx, "git-status-after-apply.log", ctx.git_status_after_apply)
 
             run_checks(ctx)
+            clean_python_bytecode_for_start(ctx, "checks")
             ctx.git_status_after_checks = git_status_porcelain(workspace.project_root)
             write_log(ctx, "git-status-after-checks.log", ctx.git_status_after_checks)
             ctx.changes_introduced_by_checks = new_changes_after_checks(
