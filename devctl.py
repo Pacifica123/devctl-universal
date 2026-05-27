@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-DEVCTL_VERSION = "0.6.4"
+DEVCTL_VERSION = "0.6.5"
 STATE_VERSION = 1
 DEFAULT_PROJECT_DIR_NAME = "project"
 DEFAULT_PATCHES_DIR_NAME = "patches"
@@ -60,6 +60,9 @@ ARCHIVE_EXCLUDED_PARTS = {
     "__pycache__",
 }
 ARCHIVE_EXCLUDED_SUFFIXES = (".db", ".sqlite", ".sqlite3")
+ARCHIVE_INCLUDED_PATHS = {
+    "build/pyinstaller.spec",
+}
 WORKSPACE_ARCHIVE_REQUIRED_EXCLUDES = [
     "UserTestSpace",
     "__pycache__",
@@ -262,8 +265,9 @@ def default_archive_excludes() -> list[str]:
     Keeping these defaults in one place prevents a newly initialized workspace
     from immediately being reported as outdated by `devctl status`.
     """
+    include_overrides = [f"!{item}" for item in sorted(ARCHIVE_INCLUDED_PATHS)]
     return unique_strings(
-        [*sorted(ARCHIVE_EXCLUDED_PARTS), *ARCHIVE_EXCLUDED_SUFFIXES, *WORKSPACE_ARCHIVE_REQUIRED_EXCLUDES]
+        [*sorted(ARCHIVE_EXCLUDED_PARTS), *ARCHIVE_EXCLUDED_SUFFIXES, *WORKSPACE_ARCHIVE_REQUIRED_EXCLUDES, *include_overrides]
     )
 
 
@@ -1235,31 +1239,64 @@ def validate_patch_files_root(candidate: PatchCandidate, manifest: dict[str, Any
 # ---------------------------------------------------------------------------
 
 
+def archive_include_overrides(extra_excludes: Iterable[str] = ()) -> list[str]:
+    overrides = list(sorted(ARCHIVE_INCLUDED_PATHS))
+    for pattern in extra_excludes:
+        if not isinstance(pattern, str) or not pattern.startswith("!"):
+            continue
+        normalized = pattern[1:].replace("\\", "/").strip("/")
+        if normalized:
+            overrides.append(normalized)
+    return unique_strings(overrides)
+
+
+def matches_archive_include_override(relative_posix: str, extra_excludes: Iterable[str] = ()) -> bool:
+    normalized_rel = relative_posix.replace("\\", "/").strip("/")
+    if not normalized_rel:
+        return False
+    is_dir = relative_posix.endswith("/")
+    for pattern in archive_include_overrides(extra_excludes):
+        normalized_pattern = pattern.replace("\\", "/").strip("/")
+        if not normalized_pattern:
+            continue
+        if is_dir and not any(char in normalized_pattern for char in "*?["):
+            # Directory pruning must keep parents of explicitly included files.
+            if normalized_pattern.startswith(normalized_rel + "/"):
+                return True
+        if fnmatch.fnmatch(normalized_rel, normalized_pattern):
+            return True
+    return False
+
+
 def should_exclude_from_archive(relative_posix: str, extra_excludes: Iterable[str] = ()) -> bool:
+    extra_excludes = tuple(extra_excludes or ())
     if relative_posix == ".":
         return False
-    name = Path(relative_posix).name
-    parts = set(relative_posix.split("/"))
+    normalized_rel = relative_posix.replace("\\", "/").strip("/")
+    if matches_archive_include_override(relative_posix, extra_excludes):
+        return False
+    name = Path(normalized_rel).name
+    parts = set(part for part in normalized_rel.split("/") if part)
     if ".env.example" == name:
         return False
     if name == ".env" or name.startswith(".env."):
         return True
     if parts & ARCHIVE_EXCLUDED_PARTS:
         return True
-    lower = relative_posix.lower()
+    lower = normalized_rel.lower()
     if lower.endswith(ARCHIVE_EXCLUDED_SUFFIXES):
         return True
     for pattern in extra_excludes:
         if not pattern or pattern.startswith("!"):
             continue
-        normalized = pattern.strip("/")
+        normalized = pattern.replace("\\", "/").strip("/")
         if not normalized:
             continue
         if normalized.endswith("/"):
             normalized = normalized.strip("/")
-            if normalized in parts or relative_posix.startswith(normalized + "/"):
+            if normalized in parts or normalized_rel.startswith(normalized + "/"):
                 return True
-        if fnmatch.fnmatch(relative_posix, normalized):
+        if fnmatch.fnmatch(normalized_rel, normalized):
             return True
     return False
 
