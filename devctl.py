@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-devctl v0.6.4 — проектно-независимый конвейер применения ИИ-патчей на чистом Python.
+devctl v0.6.6 — проектно-независимый конвейер применения ИИ-патчей на чистом Python.
 
 Базовый поток конвейера: применить патч -> выполнить проверки -> создать коммит -> отправить в remote.
 
@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-DEVCTL_VERSION = "0.6.5"
+DEVCTL_VERSION = "0.6.6"
 STATE_VERSION = 1
 DEFAULT_PROJECT_DIR_NAME = "project"
 DEFAULT_PATCHES_DIR_NAME = "patches"
@@ -127,7 +127,7 @@ class PatchCandidate:
     sha256: str | None = None
     manifest: dict[str, Any] | None = None
     manifest_error: str | None = None
-    sort_key: tuple[int, float] = (0, 0.0)
+    sort_key: tuple[Any, ...] = (0.0, 0.0, 0.0, "")
 
     @property
     def patch_id(self) -> str | None:
@@ -680,20 +680,27 @@ def read_manifest_from_zip(path: Path) -> tuple[dict[str, Any] | None, str | Non
     return data, None
 
 
-def candidate_sort_key(path: Path, manifest: dict[str, Any] | None) -> tuple[int, float]:
+def candidate_sort_key(path: Path, manifest: dict[str, Any] | None) -> tuple[float, float, float, str]:
+    """Ключ порядка патчей: сначала фактически добавленный/обновлённый zip.
+
+    Пользователь кладёт очередной patch.zip в patches/ вручную, поэтому
+    главным сигналом должен быть mtime файла в этой папке. Внутренние
+    createdAt и timestamp в имени остаются запасными tie-breaker'ами: они
+    полезны, когда несколько файлов попали в каталог с одинаковым mtime.
+    """
+    try:
+        fs_mtime = path.stat().st_mtime
+    except OSError:
+        fs_mtime = 0.0
+
+    manifest_created = 0.0
     if isinstance(manifest, dict):
         created = manifest.get("createdAt")
         if isinstance(created, str):
-            parsed = parse_iso_datetime(created)
-            if parsed is not None:
-                return (3, parsed)
-    by_name = timestamp_from_patch_filename(path)
-    if by_name is not None:
-        return (2, by_name)
-    try:
-        return (1, path.stat().st_mtime)
-    except OSError:
-        return (0, 0.0)
+            manifest_created = parse_iso_datetime(created) or 0.0
+
+    filename_ts = timestamp_from_patch_filename(path) or 0.0
+    return (fs_mtime, manifest_created, filename_ts, path.name.lower())
 
 
 def list_patch_candidates(workspace: Workspace) -> list[PatchCandidate]:
@@ -2186,8 +2193,16 @@ def build_status_payload(workspace_arg: str | None = None) -> tuple[dict[str, An
         item = patch_to_json(candidate, workspace) or {}
         item["status"] = candidate_status_text(workspace, state, candidate)
         items.append(item)
-    latest = items[0] if items else None
-    payload["patches"] = {"count": len(candidates), "latest": latest, "items": items}
+    latest_candidate = find_latest_unapplied_patch(workspace, state, candidates)
+    latest = patch_to_json(latest_candidate, workspace) if latest_candidate else None
+    if latest:
+        latest["status"] = candidate_status_text(workspace, state, latest_candidate)
+    payload["patches"] = {
+        "count": len(candidates),
+        "unappliedCount": sum(1 for item in items if item.get("status") == "ожидает применения"),
+        "latest": latest,
+        "items": items,
+    }
 
     runs = state.get("runs", []) if isinstance(state, dict) else []
     payload["state"].update(
@@ -3257,7 +3272,13 @@ def select_patch_for_readonly(workspace: Workspace, patch_arg: str | None) -> Pa
             candidate.manifest_error = f"не удалось посчитать hash патча: {exc}"
         return candidate
     candidates = list_patch_candidates(workspace)
-    return candidates[0] if candidates else None
+    if not candidates:
+        return None
+    try:
+        state = load_state(workspace)
+    except DevctlError:
+        state = {"version": STATE_VERSION, "runs": []}
+    return find_latest_unapplied_patch(workspace, state, candidates)
 
 
 def zip_files_under_root(path: Path, files_root: str) -> list[str]:
@@ -3283,7 +3304,7 @@ def build_inspect_payload(args: argparse.Namespace, *, plan: bool = False) -> tu
             "plan": plan,
             "workspace": workspace_to_json(workspace),
             "patch": None,
-            "message": "Zip-файлы патчей не найдены.",
+            "message": "Zip-файлы патчей не найдены или все кандидаты уже применены.",
         }, 0
 
     payload: dict[str, Any] = {
