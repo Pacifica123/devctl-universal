@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-devctl v0.6.3 — проектно-независимый конвейер применения ИИ-патчей на чистом Python.
+devctl v0.6.4 — проектно-независимый конвейер применения ИИ-патчей на чистом Python.
 
 Базовый поток конвейера: применить патч -> выполнить проверки -> создать коммит -> отправить в remote.
 
@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-DEVCTL_VERSION = "0.6.3"
+DEVCTL_VERSION = "0.6.4"
 STATE_VERSION = 1
 DEFAULT_PROJECT_DIR_NAME = "project"
 DEFAULT_PATCHES_DIR_NAME = "patches"
@@ -60,6 +60,15 @@ ARCHIVE_EXCLUDED_PARTS = {
     "__pycache__",
 }
 ARCHIVE_EXCLUDED_SUFFIXES = (".db", ".sqlite", ".sqlite3")
+WORKSPACE_ARCHIVE_REQUIRED_EXCLUDES = [
+    "UserTestSpace",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "*.pyc",
+    "*.pyo",
+]
 RELEASE_DIR_NAME = "release"
 RELEASE_ARCHIVE_PAYLOAD_SUFFIXES = (".zip",)
 RELEASE_EXECUTABLE_PAYLOAD_SUFFIXES = (".exe",)
@@ -233,6 +242,29 @@ def slugify(value: str | None, fallback: str = "patch") -> str:
 
 def short_sha(value: str | None, length: int = 7) -> str:
     return (value or "unknown")[:length]
+
+
+def unique_strings(values: Iterable[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value)
+        if text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def default_archive_excludes() -> list[str]:
+    """Archive excludes written by fresh init and expected by upgrade checks.
+
+    Keeping these defaults in one place prevents a newly initialized workspace
+    from immediately being reported as outdated by `devctl status`.
+    """
+    return unique_strings(
+        [*sorted(ARCHIVE_EXCLUDED_PARTS), *ARCHIVE_EXCLUDED_SUFFIXES, *WORKSPACE_ARCHIVE_REQUIRED_EXCLUDES]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2895,15 +2927,7 @@ def normalize_workspace_config_for_upgrade(
         exclude = []
         archive_config["exclude"] = exclude
         changes.append("archive.exclude")
-    required_excludes = [
-        "UserTestSpace",
-        "__pycache__",
-        ".pytest_cache",
-        ".mypy_cache",
-        ".ruff_cache",
-        "*.pyc",
-        "*.pyo",
-    ]
+    required_excludes = WORKSPACE_ARCHIVE_REQUIRED_EXCLUDES
     existing = {str(item) for item in exclude}
     for item in required_excludes:
         if item not in existing:
@@ -2946,8 +2970,7 @@ def workspace_config_upgrade_status(workspace: Workspace) -> dict[str, Any]:
             archive = config.get("archive") if isinstance(config.get("archive"), dict) else {}
             exclude = archive.get("exclude") if isinstance(archive, dict) else []
             exclude_values = {str(item) for item in exclude} if isinstance(exclude, list) else set()
-            required = ["UserTestSpace", "__pycache__", ".pytest_cache", "*.pyc", "*.pyo"]
-            info["missingArchiveExcludes"] = [item for item in required if item not in exclude_values]
+            info["missingArchiveExcludes"] = [item for item in WORKSPACE_ARCHIVE_REQUIRED_EXCLUDES if item not in exclude_values]
         except Exception as exc:
             info["error"] = str(exc)
             info["upgradeAvailable"] = True
@@ -3131,7 +3154,7 @@ def init_command(args: argparse.Namespace) -> int:
         "userTestSpaceDir": posix_rel_or_dot(uts_dir, workspace_root),
         "git": git_config,
         "archive": {
-            "exclude": sorted(ARCHIVE_EXCLUDED_PARTS) + list(ARCHIVE_EXCLUDED_SUFFIXES),
+            "exclude": default_archive_excludes(),
         },
         "checkProfiles": {
             "default": []
