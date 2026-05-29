@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-DEVCTL_VERSION = "0.6.6"
+DEVCTL_VERSION = "0.6.7"
 STATE_VERSION = 1
 DEFAULT_PROJECT_DIR_NAME = "project"
 DEFAULT_PATCHES_DIR_NAME = "patches"
@@ -2117,6 +2117,7 @@ def git_status_to_json(workspace: Workspace) -> dict[str, Any]:
         "branch": None,
         "head": None,
         "aheadBehind": None,
+        "remoteUrl": None,
         "error": None,
     }
     if not info["available"]:
@@ -2127,6 +2128,7 @@ def git_status_to_json(workspace: Workspace) -> dict[str, Any]:
         return info
     try:
         porcelain = git_status_porcelain(workspace.project_root)
+        info["remoteUrl"] = git_remote_url(workspace.project_root, "origin")
         info["porcelain"] = porcelain
         info["clean"] = not porcelain.strip()
         info["statusShort"] = git_status_short(workspace.project_root)
@@ -3463,6 +3465,462 @@ def inspect_command(args: argparse.Namespace, *, plan: bool = False) -> int:
         print("Файлы не изменялись. Запустите `devctl start`, чтобы выполнить конвейер.")
     return 0
 
+
+# ---------------------------------------------------------------------------
+# Workspace sync command
+# ---------------------------------------------------------------------------
+
+
+
+def validate_remote_name(remote: str) -> str:
+    value = (remote or "origin").strip()
+    if not value or any(ch.isspace() for ch in value) or value.startswith("-"):
+        raise DevctlError(f"Некорректное имя Git remote: {remote!r}")
+    return value
+
+
+def set_git_remote_url(project_root: Path, remote: str, remote_url: str, result: dict[str, Any]) -> bool:
+    remote = validate_remote_name(remote)
+    existing_remote = git(project_root, ["remote", "get-url", remote])
+    if existing_remote.returncode == 0:
+        set_result = git(project_root, ["remote", "set-url", remote, remote_url])
+        action = "set-url"
+    else:
+        set_result = git(project_root, ["remote", "add", remote, remote_url])
+        action = "add"
+    if set_result.returncode != 0:
+        result.setdefault("errors", []).append(f"git remote {action} {remote} завершился ошибкой: {command_error_summary(set_result)}")
+        return False
+    result["remoteLinked"] = True
+    result.setdefault("operations", []).append(f"remote {action} {remote}")
+    return True
+
+
+def fetch_git_remote(project_root: Path, remote: str, result: dict[str, Any]) -> bool:
+    remote = validate_remote_name(remote)
+    fetch_result = git(project_root, ["fetch", "--prune", remote], timeout=300)
+    if fetch_result.returncode != 0:
+        result.setdefault("errors", []).append(f"git fetch --prune {remote} завершился ошибкой: {command_error_summary(fetch_result)}")
+        return False
+    result.setdefault("operations", []).append(f"fetch --prune {remote}")
+    return True
+
+
+def git_remote_url(project_root: Path, remote: str = "origin") -> str | None:
+    result = git(project_root, ["remote", "get-url", remote])
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def remote_default_branch_from_url(remote_url: str) -> str | None:
+    """Best-effort detection of a remote repository default branch.
+
+    Works before a local repository exists, so `devctl sync --remote-url ...` can
+    clone GitHub repositories whose default branch is not `main`.
+    """
+    if not git_available() or not remote_url:
+        return None
+    cwd = Path.cwd()
+    result = run_command(["git", "ls-remote", "--symref", remote_url, "HEAD"], cwd, timeout=300)
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        # Example: "ref: refs/heads/main\tHEAD"
+        line = line.strip()
+        if not line.startswith("ref:") or "refs/heads/" not in line:
+            continue
+        head_ref = line.split()[1] if len(line.split()) > 1 else ""
+        if head_ref.startswith("refs/heads/"):
+            return head_ref.removeprefix("refs/heads/").strip() or None
+    return None
+
+
+def remote_default_branch_from_project(project_root: Path, remote: str = "origin") -> str | None:
+    result = git(project_root, ["symbolic-ref", "--short", f"refs/remotes/{remote}/HEAD"])
+    if result.returncode == 0 and result.stdout.strip():
+        value = result.stdout.strip()
+        prefix = f"{remote}/"
+        return value[len(prefix):] if value.startswith(prefix) else value
+    remote_url = git_remote_url(project_root, remote)
+    if remote_url:
+        return remote_default_branch_from_url(remote_url)
+    return None
+
+
+def workspace_archive_excludes(workspace: Workspace) -> list[str]:
+    config_path = workspace.state_dir / "workspace.json"
+    configured: list[str] = []
+    if config_path.is_file():
+        try:
+            config = read_json_file(config_path)
+            archive_cfg = config.get("archive") if isinstance(config.get("archive"), dict) else {}
+            raw_excludes = archive_cfg.get("exclude") if isinstance(archive_cfg, dict) else []
+            if isinstance(raw_excludes, list):
+                configured = [item for item in raw_excludes if isinstance(item, str)]
+        except DevctlError:
+            configured = []
+    return unique_strings([*default_archive_excludes(), *configured])
+
+
+def workspace_sync_archive_manifest(workspace: Workspace) -> dict[str, Any]:
+    return {
+        "archive": {
+            "nameSlug": "workspace-sync",
+            "includeProjectDir": True,
+            "exclude": workspace_archive_excludes(workspace),
+        }
+    }
+
+
+def populate_user_test_space_from_archive(
+    workspace: Workspace,
+    archive_path: Path,
+    *,
+    slug: str,
+    sha: str | None,
+) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    version_dir = unique_path(workspace.uts_dir / f"project_{timestamp}_after_{slug}_{short_sha(sha)}")
+    tmp_dir = unique_path(workspace.uts_dir / f".tmp_{version_dir.name}")
+    try:
+        workspace.uts_dir.mkdir(parents=True, exist_ok=True)
+        safe_extract_zip(archive_path, tmp_dir)
+        entries = [path for path in tmp_dir.iterdir()] if tmp_dir.exists() else []
+        project_dir = version_dir / "project"
+        project_dir.parent.mkdir(parents=True, exist_ok=True)
+        if len(entries) == 1 and entries[0].is_dir():
+            shutil.move(str(entries[0]), str(project_dir))
+        else:
+            project_dir.mkdir(parents=True, exist_ok=False)
+            for entry in entries:
+                shutil.move(str(entry), str(project_dir / entry.name))
+        return project_dir
+    finally:
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def ensure_workspace_runtime_dirs(workspace: Workspace) -> list[str]:
+    created: list[str] = []
+    for path_to_create, label in (
+        (workspace.patches_dir, "patches"),
+        (workspace.archives_dir, "archives"),
+        (workspace.uts_dir, "UserTestSpace"),
+        (workspace.state_dir, ".devctl"),
+    ):
+        existed = path_to_create.exists()
+        path_to_create.mkdir(parents=True, exist_ok=True)
+        if not existed:
+            created.append(label)
+    if not workspace.state_file.exists():
+        write_json_file(workspace.state_file, {"version": STATE_VERSION, "runs": []})
+        created.append(".devctl/state.json")
+    return created
+
+
+def sync_existing_git_from_remote(
+    workspace: Workspace,
+    *,
+    remote: str,
+    remote_url: str | None,
+    branch: str | None,
+    discard_local: bool,
+    clean_mode: str,
+    payload: dict[str, Any],
+) -> str:
+    project_root = workspace.project_root
+    git_payload = payload.setdefault("git", {})
+    operations = git_payload.setdefault("operations", [])
+
+    if remote_url:
+        if not set_git_remote_url(project_root, remote, remote_url, git_payload):
+            raise DevctlError("; ".join(git_payload.get("errors") or ["не удалось привязать remote origin"]))
+    else:
+        remote_url = git_remote_url(project_root, remote)
+        if not remote_url:
+            raise DevctlError(
+                f"В project/ не найден remote {remote!r}. Передайте `devctl sync --remote-url <GitHub URL>` "
+                "или задайте origin вручную."
+            )
+
+    git_payload["remote"] = remote
+    git_payload["remoteUrl"] = remote_url
+
+    if not fetch_git_remote(project_root, remote, git_payload):
+        raise DevctlError("; ".join(git_payload.get("errors") or [f"git fetch --prune {remote} завершился ошибкой"]))
+
+    resolved_branch = (
+        (branch or "").strip()
+        or str(workspace_git_config(workspace).get("branch") or "").strip()
+        or remote_default_branch_from_project(project_root, remote)
+    )
+    if not resolved_branch:
+        try:
+            resolved_branch = git_branch(project_root)
+        except DevctlError:
+            resolved_branch = "main"
+    git_payload["branch"] = resolved_branch
+
+    if not remote_ref_exists(project_root, remote, resolved_branch):
+        raise DevctlError(
+            f"Remote-ветка {remote}/{resolved_branch} не найдена. Укажите другую ветку через `--branch` "
+            "или проверьте remote URL."
+        )
+
+    status_before = git_status_porcelain(project_root)
+    git_payload["statusBefore"] = status_before
+    git_payload["dirtyBefore"] = bool(status_before.strip())
+
+    if discard_local:
+        if has_git_commit(project_root):
+            reset_current = git_reset_hard(project_root, "HEAD")
+            if reset_current.returncode != 0:
+                raise DevctlError("git reset --hard HEAD завершился ошибкой: " + command_error_summary(reset_current))
+            operations.append("reset --hard HEAD")
+        clean_before = git_clean(project_root, clean_mode)
+        if clean_before.returncode != 0:
+            raise DevctlError("git clean перед checkout завершился ошибкой: " + command_error_summary(clean_before))
+        operations.append(f"clean -{clean_mode}")
+
+        checkout = git(project_root, ["checkout", "-B", resolved_branch, f"{remote}/{resolved_branch}"], timeout=180)
+        if checkout.returncode != 0:
+            raise DevctlError(f"git checkout -B {resolved_branch} {remote}/{resolved_branch} завершился ошибкой: {command_error_summary(checkout)}")
+        operations.append(f"checkout -B {resolved_branch} {remote}/{resolved_branch}")
+
+        reset_remote = git_reset_hard(project_root, f"{remote}/{resolved_branch}")
+        if reset_remote.returncode != 0:
+            raise DevctlError(f"git reset --hard {remote}/{resolved_branch} завершился ошибкой: {command_error_summary(reset_remote)}")
+        operations.append(f"reset --hard {remote}/{resolved_branch}")
+
+        clean_after = git_clean(project_root, clean_mode)
+        if clean_after.returncode != 0:
+            raise DevctlError("git clean после reset завершился ошибкой: " + command_error_summary(clean_after))
+        operations.append(f"clean -{clean_mode}")
+    else:
+        if status_before.strip():
+            raise DevctlError(
+                "Рабочее дерево project/ содержит локальные изменения. "
+                "Закоммитьте/уберите их или повторите `devctl sync --discard-local`, если GitHub действительно источник истины."
+            )
+        current_branch: str | None = None
+        try:
+            current_branch = git_branch(project_root)
+        except DevctlError:
+            current_branch = None
+        if current_branch != resolved_branch:
+            if local_branch_exists(project_root, resolved_branch):
+                checkout = git(project_root, ["checkout", resolved_branch], timeout=180)
+            else:
+                checkout = git(project_root, ["checkout", "-B", resolved_branch, f"{remote}/{resolved_branch}"], timeout=180)
+            if checkout.returncode != 0:
+                raise DevctlError(f"git checkout {resolved_branch} завершился ошибкой: {command_error_summary(checkout)}")
+            operations.append(f"checkout {resolved_branch}")
+
+        ahead, behind, error = ahead_behind(project_root, remote, resolved_branch)
+        git_payload["aheadBehindBefore"] = {"ahead": ahead, "behind": behind, "error": error}
+        if error:
+            raise DevctlError(error)
+        if ahead and ahead > 0:
+            raise DevctlError(
+                f"Локальная ветка содержит {ahead} commit(ов), которых нет в {remote}/{resolved_branch}. "
+                "Безопасный sync остановлен. Для режима 'GitHub — источник истины' повторите с `--discard-local`."
+            )
+        if behind and behind > 0:
+            pull_result = git(project_root, ["pull", "--ff-only", remote, resolved_branch], timeout=300)
+            if pull_result.returncode != 0:
+                raise DevctlError(f"git pull --ff-only {remote} {resolved_branch} завершился ошибкой: {command_error_summary(pull_result)}")
+            operations.append(f"pull --ff-only {remote} {resolved_branch}")
+        else:
+            operations.append("already up-to-date")
+
+    git_payload["headAfter"] = git_head(project_root) if has_git_commit(project_root) else None
+    git_payload["statusAfter"] = git_status_porcelain(project_root)
+    git_payload["cleanAfter"] = not str(git_payload.get("statusAfter") or "").strip()
+    git_payload["synced"] = True
+    return resolved_branch
+
+
+def sync_clone_from_remote(
+    workspace: Workspace,
+    *,
+    remote_url: str | None,
+    branch: str | None,
+    payload: dict[str, Any],
+) -> str:
+    project_root = workspace.project_root
+    if project_root.exists() and not project_root.is_dir():
+        raise DevctlError(f"Путь project не является каталогом: {project_root}")
+    if project_root.exists() and directory_has_entries(project_root):
+        raise DevctlError(
+            f"project/ существует, не пуст и не является Git-репозиторием: {project_root}. "
+            "devctl sync не удаляет такой каталог автоматически. Освободите project/ или создайте новый workspace."
+        )
+    if not remote_url:
+        raise DevctlError(
+            "project/ отсутствует или не является Git-репозиторием, а remote не задан. "
+            "Передайте `devctl sync --remote-url <GitHub URL>`."
+        )
+    resolved_branch = (branch or "").strip() or remote_default_branch_from_url(remote_url) or "main"
+    git_result = init_git_repository(project_root, branch=resolved_branch, remote_url=remote_url)
+    payload["git"] = git_result
+    if git_result.get("errors"):
+        raise DevctlError("; ".join(str(item) for item in git_result.get("errors") or []))
+    git_result["headAfter"] = git_head(project_root) if has_git_commit(project_root) else None
+    git_result["statusAfter"] = git_status_porcelain(project_root) if (project_root / ".git").exists() else ""
+    git_result["cleanAfter"] = not str(git_result.get("statusAfter") or "").strip()
+    return str(git_result.get("branch") or resolved_branch)
+
+
+def build_sync_artifacts(
+    workspace: Workspace,
+    *,
+    no_archive: bool,
+    no_uts: bool,
+    payload: dict[str, Any],
+) -> None:
+    if no_archive and not no_uts:
+        raise DevctlError("Нельзя обновить UTS без свежего архива: уберите --no-archive или добавьте --no-uts.")
+    head = payload.get("git", {}).get("headAfter") if isinstance(payload.get("git"), dict) else None
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive_path: Path | None = None
+    run_dir: Path | None = None
+
+    if not no_archive:
+        run_dir = unique_path(workspace.archives_dir / f"{timestamp}_workspace-sync_{short_sha(head)}")
+        archive_filename = archive_name(workspace.project_root.name, timestamp, "post", "after_workspace-sync", short_sha(head))
+        archive_path, file_count = create_project_archive(
+            workspace,
+            run_dir / archive_filename,
+            manifest=workspace_sync_archive_manifest(workspace),
+        )
+        report = {
+            "version": DEVCTL_VERSION,
+            "createdAt": iso_now(),
+            "kind": "workspace-sync",
+            "workspace": workspace_to_json(workspace),
+            "git": payload.get("git"),
+            "archive": {"path": str(archive_path), "fileCount": file_count},
+        }
+        write_json_file(run_dir / "sync-report.json", report)
+        payload["archive"] = {
+            "created": True,
+            "path": str(archive_path),
+            "relativePath": rel_display(archive_path, workspace.workspace_root),
+            "runDir": str(run_dir),
+            "relativeRunDir": rel_display(run_dir, workspace.workspace_root),
+            "fileCount": file_count,
+        }
+    else:
+        payload["archive"] = {"created": False, "path": None, "runDir": None, "fileCount": 0}
+
+    if not no_uts:
+        assert archive_path is not None
+        uts_project = populate_user_test_space_from_archive(
+            workspace,
+            archive_path,
+            slug="workspace-sync",
+            sha=str(head or ""),
+        )
+        payload["uts"] = {
+            "created": True,
+            "projectDir": str(uts_project),
+            "relativeProjectDir": rel_display(uts_project, workspace.workspace_root),
+        }
+    else:
+        payload["uts"] = {"created": False, "projectDir": None}
+
+
+def sync_command(args: argparse.Namespace) -> int:
+    json_enabled = bool(getattr(args, "json", False))
+    payload: dict[str, Any] = {
+        "ok": False,
+        "version": DEVCTL_VERSION,
+        "workspace": None,
+        "created": [],
+        "git": {
+            "available": git_available(),
+            "synced": False,
+            "remote": getattr(args, "remote", "origin"),
+            "remoteUrl": (getattr(args, "remote_url", None) or None),
+            "branch": (getattr(args, "branch", None) or None),
+            "discardLocal": bool(getattr(args, "discard_local", False)),
+            "operations": [],
+            "errors": [],
+            "warnings": [],
+        },
+        "archive": {"created": False},
+        "uts": {"created": False},
+        "warnings": [],
+        "error": None,
+    }
+    try:
+        workspace = discover_workspace(workspace_arg_from_namespace(args))
+        payload["workspace"] = workspace_to_json(workspace)
+        payload["created"] = ensure_workspace_runtime_dirs(workspace)
+
+        if not git_available():
+            raise DevctlError("команда git не найдена")
+
+        remote = validate_remote_name(getattr(args, "remote", "origin") or "origin")
+        remote_url = (getattr(args, "remote_url", None) or "").strip() or None
+        branch = (getattr(args, "branch", None) or "").strip() or None
+        clean_mode = getattr(args, "clean_mode", "fd")
+        discard_local = bool(getattr(args, "discard_local", False))
+
+        is_repo = (workspace.project_root / ".git").exists()
+        if is_repo:
+            resolved_branch = sync_existing_git_from_remote(
+                workspace,
+                remote=remote,
+                remote_url=remote_url,
+                branch=branch,
+                discard_local=discard_local,
+                clean_mode=clean_mode,
+                payload=payload,
+            )
+        else:
+            resolved_branch = sync_clone_from_remote(
+                workspace,
+                remote_url=remote_url,
+                branch=branch,
+                payload=payload,
+            )
+        payload.setdefault("git", {})["branch"] = resolved_branch
+
+        build_sync_artifacts(
+            workspace,
+            no_archive=bool(getattr(args, "no_archive", False)),
+            no_uts=bool(getattr(args, "no_uts", False)),
+            payload=payload,
+        )
+        payload["ok"] = True
+
+        if json_enabled:
+            emit_json(payload)
+        else:
+            print_header("devctl sync")
+            print(f"Workspace:      {workspace.workspace_root}")
+            print(f"Project:        {workspace.project_root}")
+            print(f"Remote:         {payload.get('git', {}).get('remoteUrl') or 'неизвестно'}")
+            print(f"Ветка:          {payload.get('git', {}).get('branch') or 'неизвестно'}")
+            print(f"Режим:          {'GitHub источник истины (--discard-local)' if discard_local else 'безопасный ff-only'}")
+            operations = payload.get("git", {}).get("operations") or []
+            print(f"Git-шаги:       {', '.join(str(item) for item in operations) if operations else 'нет'}")
+            archive = payload.get("archive") if isinstance(payload.get("archive"), dict) else {}
+            print(f"Архив:          {archive.get('relativePath') or ('не создавался' if getattr(args, 'no_archive', False) else 'нет')}")
+            uts = payload.get("uts") if isinstance(payload.get("uts"), dict) else {}
+            print(f"UTS:            {uts.get('relativeProjectDir') or ('не обновлялся' if getattr(args, 'no_uts', False) else 'нет')}")
+        return 0
+    except DevctlError as exc:
+        payload["error"] = str(exc)
+        if json_enabled:
+            emit_json(payload)
+        else:
+            print(f"[ОШИБКА] {exc}")
+        return 2
+
 # ---------------------------------------------------------------------------
 # Release install / shell completion helpers
 # ---------------------------------------------------------------------------
@@ -4053,7 +4511,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser._positionals.title = "команды"
     parser._optionals.title = "параметры"
-    subparsers = parser.add_subparsers(dest="command", required=True, metavar="{init,status,inspect,plan,start,reset,completion,self}")
+    subparsers = parser.add_subparsers(dest="command", required=True, metavar="{init,sync,status,inspect,plan,start,reset,completion,self}")
 
     init = subparsers.add_parser("init", help="Создать или безопасно обновить структуру workspace")
     init.add_argument("--workspace", default=None, help="Корень рабочей области. По умолчанию текущий каталог.")
@@ -4068,6 +4526,16 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--git-init", action="store_true", help="Инициализировать локальный Git-репозиторий в каталоге проекта")
     init.add_argument("--branch", default=None, help="Имя основной ветки для нового Git-репозитория, например main")
     init.add_argument("--remote-url", default=None, help="Необязательный URL GitHub/Git remote для origin; при указании project/ будет клонирован или синхронизирован через fetch/pull")
+
+    sync = subparsers.add_parser("sync", help="Синхронизировать workspace с GitHub: project -> archives -> UserTestSpace")
+    sync.add_argument("--json", action="store_true", help="Вывести машинно-читаемый JSON")
+    sync.add_argument("--remote", default="origin", help="Имя Git remote. По умолчанию origin")
+    sync.add_argument("--remote-url", default=None, help="GitHub/Git URL для origin; нужен, если локальный project ещё не привязан")
+    sync.add_argument("--branch", default=None, help="Ветка-источник. По умолчанию git.branch из workspace, remote HEAD, текущая ветка или main")
+    sync.add_argument("--discard-local", action="store_true", help="Считать remote источником истины: reset --hard origin/branch + git clean")
+    sync.add_argument("--clean-mode", choices=("fd", "fdx"), default="fd", help="Режим git clean для --discard-local. По умолчанию fd")
+    sync.add_argument("--no-archive", action="store_true", help="Не создавать свежий архив после Git-синхронизации")
+    sync.add_argument("--no-uts", action="store_true", help="Не разворачивать свежий архив в UserTestSpace")
 
     status = subparsers.add_parser("status", help="Показать состояние рабочей области/Git/патчей без изменений")
     status.add_argument("--json", action="store_true", help="Вывести машинно-читаемый JSON")
@@ -4117,6 +4585,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "init":
             return init_command(args)
+        if args.command == "sync":
+            return sync_command(args)
         if args.command == "status":
             return status_command(args)
         if args.command == "inspect":
