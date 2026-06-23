@@ -9,6 +9,15 @@
     "branch": "main",
     "expectedHead": null
   },
+  "target": {
+    "projectId": "devctl",
+    "workspaceId": "devctl",
+    "projectName": "devctl universal",
+    "expectedFiles": [
+      "devctl.py",
+      "README.md"
+    ]
+  },
   "apply": {
     "filesRoot": "files",
     "delete": []

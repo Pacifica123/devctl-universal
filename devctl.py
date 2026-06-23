@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-devctl v0.6.6 — проектно-независимый конвейер применения ИИ-патчей на чистом Python.
+devctl v0.7.0 — проектно-независимый конвейер применения ИИ-патчей на чистом Python.
 
 Базовый поток конвейера: применить патч -> выполнить проверки -> создать коммит -> отправить в remote.
 
@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-DEVCTL_VERSION = "0.6.7"
+DEVCTL_VERSION = "0.7.0"
 STATE_VERSION = 1
 DEFAULT_PROJECT_DIR_NAME = "project"
 DEFAULT_PATCHES_DIR_NAME = "patches"
@@ -40,6 +40,8 @@ DEFAULT_ARCHIVES_DIR_NAME = "archives"
 DEFAULT_UTS_DIR_NAME = "UserTestSpace"
 DEVCTL_WORKSPACE_ENV = "DEVCTL_WORKSPACE"
 DEVCTL_COMMAND_NAME = "devctl"
+GLOBAL_CONFIG_VERSION = 1
+INBOX_SUBDIRS = ("incoming", "imported", "rejected", "duplicate")
 LEGACY_ARCHIVES_DIR_ALIASES = ("arhives",)
 PATCH_FILENAME_RE = re.compile(r"patch_(\d{8})_(\d{6})(?:_.*)?\.zip$", re.IGNORECASE)
 
@@ -269,6 +271,642 @@ def default_archive_excludes() -> list[str]:
     return unique_strings(
         [*sorted(ARCHIVE_EXCLUDED_PARTS), *ARCHIVE_EXCLUDED_SUFFIXES, *WORKSPACE_ARCHIVE_REQUIRED_EXCLUDES, *include_overrides]
     )
+
+
+
+# ---------------------------------------------------------------------------
+# Global config / Patch Intake registry
+# ---------------------------------------------------------------------------
+
+
+def devctl_config_dir() -> Path:
+    """User-wide devctl config directory, independent from any workspace."""
+    if os.name == "nt":
+        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+        return base / "devctl"
+    return Path.home() / ".config" / "devctl"
+
+
+def devctl_global_config_path() -> Path:
+    return devctl_config_dir() / "config.json"
+
+
+def devctl_inbox_index_path() -> Path:
+    return devctl_config_dir() / "inbox_index.json"
+
+
+def default_global_config() -> dict[str, Any]:
+    return {"version": GLOBAL_CONFIG_VERSION, "patchInboxDirs": [], "workspaces": []}
+
+
+def normalize_user_path_text(path: Path | str) -> str:
+    try:
+        return str(expand_user_path(path).resolve())
+    except Exception:
+        return str(expand_user_path(path))
+
+
+def load_global_config() -> dict[str, Any]:
+    path = devctl_global_config_path()
+    if not path.exists():
+        return default_global_config()
+    data = read_json_file(path)
+    if not isinstance(data.get("patchInboxDirs", []), list):
+        data["patchInboxDirs"] = []
+    if not isinstance(data.get("workspaces", []), list):
+        data["workspaces"] = []
+    data.setdefault("version", GLOBAL_CONFIG_VERSION)
+    return data
+
+
+def save_global_config(config: dict[str, Any]) -> None:
+    config.setdefault("version", GLOBAL_CONFIG_VERSION)
+    config.setdefault("patchInboxDirs", [])
+    config.setdefault("workspaces", [])
+    write_json_file(devctl_global_config_path(), config)
+
+
+def load_inbox_index() -> dict[str, Any]:
+    path = devctl_inbox_index_path()
+    if not path.exists():
+        return {"version": GLOBAL_CONFIG_VERSION, "imports": []}
+    data = read_json_file(path)
+    if not isinstance(data.get("imports", []), list):
+        data["imports"] = []
+    data.setdefault("version", GLOBAL_CONFIG_VERSION)
+    return data
+
+
+def save_inbox_index(index: dict[str, Any]) -> None:
+    index.setdefault("version", GLOBAL_CONFIG_VERSION)
+    index.setdefault("imports", [])
+    write_json_file(devctl_inbox_index_path(), index)
+
+
+def import_seen(index: dict[str, Any], sha256: str | None) -> dict[str, Any] | None:
+    if not sha256:
+        return None
+    for item in reversed(index.get("imports", [])):
+        if isinstance(item, dict) and item.get("sha256") == sha256:
+            return item
+    return None
+
+
+def workspace_display_id(workspace: Workspace, explicit_id: str | None = None) -> str:
+    if explicit_id and explicit_id.strip():
+        return slugify(explicit_id.strip(), fallback="workspace")
+    config_path = workspace.state_dir / "workspace.json"
+    try:
+        cfg = read_json_file(config_path)
+    except DevctlError:
+        cfg = {}
+    for key in ("id", "workspaceId", "name"):
+        value = cfg.get(key)
+        if isinstance(value, str) and value.strip():
+            return slugify(value, fallback="workspace")
+    return slugify(workspace.workspace_root.name or workspace.project_root.name, fallback="workspace")
+
+
+def workspace_display_name(workspace: Workspace, explicit_name: str | None = None) -> str:
+    if explicit_name and explicit_name.strip():
+        return explicit_name.strip()
+    config_path = workspace.state_dir / "workspace.json"
+    try:
+        cfg = read_json_file(config_path)
+    except DevctlError:
+        cfg = {}
+    for key in ("name", "projectName", "id", "workspaceId"):
+        value = cfg.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return workspace.workspace_root.name or workspace.project_root.name or "workspace"
+
+
+def workspace_record_to_json(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": record.get("id"),
+        "name": record.get("name"),
+        "path": record.get("path"),
+    }
+
+
+def registered_workspace_by_id(config: dict[str, Any], workspace_id: str) -> dict[str, Any] | None:
+    needle = workspace_id.strip().lower()
+    for record in config.get("workspaces", []):
+        if not isinstance(record, dict):
+            continue
+        values = [record.get("id"), record.get("name")]
+        if any(isinstance(value, str) and value.strip().lower() == needle for value in values):
+            return record
+    return None
+
+
+def register_workspace_record(config: dict[str, Any], workspace: Workspace, workspace_id: str, name: str) -> tuple[dict[str, Any], bool]:
+    path = normalize_user_path_text(workspace.workspace_root)
+    workspaces = [item for item in config.get("workspaces", []) if isinstance(item, dict)]
+    for record in workspaces:
+        if normalize_user_path_text(str(record.get("path", ""))) == path:
+            record.update({"id": workspace_id, "name": name, "path": path})
+            config["workspaces"] = workspaces
+            return record, False
+    for record in workspaces:
+        if str(record.get("id", "")).strip().lower() == workspace_id.lower():
+            raise DevctlError(
+                f"workspace id уже зарегистрирован за другим путём: {workspace_id} -> {record.get('path')}"
+            )
+    record = {"id": workspace_id, "name": name, "path": path}
+    workspaces.append(record)
+    config["workspaces"] = workspaces
+    return record, True
+
+
+def validate_workspace_registerable(workspace: Workspace) -> None:
+    config_path = workspace.state_dir / "workspace.json"
+    if not config_path.is_file():
+        raise DevctlError(f"В workspace нет .devctl/workspace.json: {config_path}")
+    if not workspace.project_root.exists() or not workspace.project_root.is_dir():
+        raise DevctlError(f"Каталог project не найден: {workspace.project_root}")
+    if not workspace.patches_dir.exists() or not workspace.patches_dir.is_dir():
+        raise DevctlError(
+            f"Каталог patches не найден: {workspace.patches_dir}. Сначала выполните `devctl init --upgrade`."
+        )
+
+
+def inbox_root_dirs(config: dict[str, Any]) -> list[Path]:
+    result: list[Path] = []
+    seen: set[str] = set()
+    for raw in config.get("patchInboxDirs", []):
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        path = expand_user_path(raw).resolve()
+        key = str(path).lower() if os.name == "nt" else str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    return result
+
+
+def ensure_inbox_dirs(root: Path) -> None:
+    for name in INBOX_SUBDIRS:
+        (root / name).mkdir(parents=True, exist_ok=True)
+
+
+def add_inbox_dir(config: dict[str, Any], root: Path) -> bool:
+    normalized = normalize_user_path_text(root)
+    items = [str(item) for item in config.get("patchInboxDirs", []) if isinstance(item, str) and item.strip()]
+    existing_keys = {normalize_user_path_text(item).lower() if os.name == "nt" else normalize_user_path_text(item) for item in items}
+    key = normalized.lower() if os.name == "nt" else normalized
+    if key in existing_keys:
+        config["patchInboxDirs"] = items
+        return False
+    config["patchInboxDirs"] = [normalized, *items]
+    return True
+
+
+def inbox_scan_sources(config: dict[str, Any]) -> list[dict[str, Path]]:
+    sources: list[dict[str, Path]] = []
+    for index, root in enumerate(inbox_root_dirs(config)):
+        source = root / "incoming" if (root / "incoming").is_dir() else root
+        sources.append({"root": root, "source": source, "primary": root if index == 0 else inbox_root_dirs(config)[0]})
+    return sources
+
+
+def unique_destination(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    for index in range(1, 10_000):
+        candidate = path.with_name(f"{stem}_{index}{suffix}")
+        if not candidate.exists():
+            return candidate
+    raise DevctlError(f"Не удалось подобрать свободное имя рядом с {path}")
+
+
+def read_patch_payload_paths(candidate: PatchCandidate) -> tuple[list[str], str | None]:
+    manifest = candidate.manifest if isinstance(candidate.manifest, dict) else {}
+    apply_cfg = manifest.get("apply") if isinstance(manifest.get("apply"), dict) else {}
+    files_root = apply_cfg.get("filesRoot", "files")
+    try:
+        files_root = validate_relative_posix_path(files_root, kind="manifest.apply.filesRoot")
+    except InvalidPatchError as exc:
+        return [], str(exc)
+    prefix = files_root.rstrip("/") + "/"
+    paths: list[str] = []
+    try:
+        with zipfile.ZipFile(candidate.path, "r") as zf:
+            for name in zf.namelist():
+                if name.endswith("/") or not name.startswith(prefix):
+                    continue
+                rel = name[len(prefix):]
+                try:
+                    rel = validate_relative_posix_path(rel, kind=f"zip entry {name}")
+                except InvalidPatchError as exc:
+                    return paths, str(exc)
+                parts = set(rel.split("/"))
+                if parts & BANNED_PATH_PARTS:
+                    return paths, f"zip entry указывает на запрещённый каталог: {rel}"
+                paths.append(rel)
+    except Exception as exc:
+        return paths, f"не удалось прочитать files/ из zip: {exc}"
+    return paths, None
+
+
+def manifest_target_hints(manifest: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("target"), dict):
+        return {}
+    target = manifest.get("target") or {}
+    hints = {
+        "projectId": target.get("projectId"),
+        "workspaceId": target.get("workspaceId"),
+        "projectName": target.get("projectName"),
+        "expectedFiles": target.get("expectedFiles") if isinstance(target.get("expectedFiles"), list) else [],
+    }
+    return hints
+
+
+def workspace_record_project(record: dict[str, Any]) -> tuple[Workspace | None, str | None]:
+    path = record.get("path")
+    if not isinstance(path, str) or not path.strip():
+        return None, "у workspace не задан path"
+    try:
+        workspace = discover_workspace_from_override(path)
+        return workspace, None
+    except DevctlError as exc:
+        return None, str(exc)
+
+
+def detect_inbox_target(candidate: PatchCandidate, config: dict[str, Any]) -> dict[str, Any]:
+    if candidate.manifest_error or not isinstance(candidate.manifest, dict):
+        return {"confidence": "reject", "workspaceId": None, "reason": candidate.manifest_error or "manifest.json не прочитан", "candidates": []}
+
+    payload_paths, payload_error = read_patch_payload_paths(candidate)
+    if payload_error:
+        return {"confidence": "reject", "workspaceId": None, "reason": payload_error, "candidates": []}
+
+    try:
+        validate_manifest(candidate.manifest)
+        validate_patch_files_root(candidate, candidate.manifest)
+    except InvalidPatchError as exc:
+        return {"confidence": "reject", "workspaceId": None, "reason": str(exc), "candidates": []}
+
+    target = manifest_target_hints(candidate.manifest)
+    raw_expected = target.get("expectedFiles") if isinstance(target.get("expectedFiles"), list) else []
+    expected: list[str] = []
+    for raw in raw_expected:
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        try:
+            expected.append(validate_relative_posix_path(raw, kind="manifest.target.expectedFiles[]"))
+        except InvalidPatchError:
+            continue
+
+    ids = {str(value).strip().lower() for value in (target.get("projectId"), target.get("workspaceId")) if isinstance(value, str) and value.strip()}
+    names = {str(value).strip().lower() for value in (target.get("projectName"),) if isinstance(value, str) and value.strip()}
+
+    candidates: list[dict[str, Any]] = []
+    for record in config.get("workspaces", []):
+        if not isinstance(record, dict):
+            continue
+        workspace, error = workspace_record_project(record)
+        record_id = str(record.get("id") or "").strip()
+        record_name = str(record.get("name") or "").strip()
+        item: dict[str, Any] = {
+            "id": record_id,
+            "name": record_name,
+            "path": record.get("path"),
+            "score": 0,
+            "idMatch": False,
+            "nameMatch": False,
+            "expectedMatches": 0,
+            "payloadMatches": 0,
+            "error": error,
+        }
+        if workspace is not None:
+            item["projectRoot"] = str(workspace.project_root)
+            if record_id and record_id.lower() in ids:
+                item["idMatch"] = True
+                item["score"] += 20
+            if record_name and record_name.lower() in names:
+                item["nameMatch"] = True
+                item["score"] += 8
+            for rel in expected:
+                if (workspace.project_root / Path(*rel.split("/"))).exists():
+                    item["expectedMatches"] += 1
+                    item["score"] += 4
+            for rel in payload_paths[:200]:
+                if (workspace.project_root / Path(*rel.split("/"))).exists():
+                    item["payloadMatches"] += 1
+                    item["score"] += 1
+        candidates.append(item)
+
+    candidates.sort(key=lambda item: (int(item.get("score") or 0), str(item.get("id") or "")), reverse=True)
+    if not candidates:
+        return {"confidence": "low", "workspaceId": None, "reason": "нет зарегистрированных workspace", "candidates": []}
+
+    best = candidates[0]
+    best_score = int(best.get("score") or 0)
+    second_score = int(candidates[1].get("score") or 0) if len(candidates) > 1 else -1
+    has_path_evidence = bool(best.get("expectedMatches") or best.get("payloadMatches"))
+    has_id_evidence = bool(best.get("idMatch") or best.get("nameMatch"))
+
+    if has_id_evidence and has_path_evidence:
+        confidence = "high"
+        reason = "target manifest совпал с workspace и подтверждён файлами"
+    elif not has_id_evidence and has_path_evidence and best_score > max(second_score, 0):
+        confidence = "medium"
+        reason = "workspace похож по файлам, но target manifest отсутствует или не совпал"
+    elif has_id_evidence:
+        confidence = "low"
+        reason = "target manifest совпал, но не подтверждён expectedFiles/files"
+    else:
+        confidence = "low"
+        reason = "не удалось однозначно определить workspace"
+
+    return {
+        "confidence": confidence,
+        "workspaceId": best.get("id") if confidence in {"high", "medium"} else None,
+        "workspacePath": best.get("path") if confidence in {"high", "medium"} else None,
+        "reason": reason,
+        "target": target,
+        "payloadFiles": payload_paths,
+        "candidates": candidates,
+    }
+
+
+def build_inbox_scan(config: dict[str, Any]) -> dict[str, Any]:
+    index = load_inbox_index()
+    items: list[dict[str, Any]] = []
+    for source in inbox_scan_sources(config):
+        source_dir = source["source"]
+        if not source_dir.exists() or not source_dir.is_dir():
+            continue
+        for path in source_dir.glob("*.zip"):
+            manifest, error = read_manifest_from_zip(path)
+            candidate = PatchCandidate(path=path, manifest=manifest, manifest_error=error, sort_key=candidate_sort_key(path, manifest))
+            try:
+                candidate.sha256 = sha256_file(path)
+            except Exception as exc:
+                candidate.manifest_error = f"не удалось посчитать hash патча: {exc}"
+            target = detect_inbox_target(candidate, config)
+            duplicate = import_seen(index, candidate.sha256)
+            status = "duplicate" if duplicate else ("valid" if target.get("confidence") != "reject" else "invalid")
+            items.append(
+                {
+                    "name": path.name,
+                    "path": str(path),
+                    "sourceDir": str(source_dir),
+                    "inboxRoot": str(source["root"]),
+                    "primaryInboxRoot": str(source["primary"]),
+                    "mtime": path.stat().st_mtime if path.exists() else 0.0,
+                    "sha256": candidate.sha256,
+                    "patchId": candidate.patch_id,
+                    "title": candidate.title,
+                    "manifestError": candidate.manifest_error,
+                    "status": status,
+                    "duplicateOf": duplicate,
+                    "target": target,
+                    "sortKey": list(candidate.sort_key),
+                }
+            )
+    items.sort(key=lambda item: tuple(item.get("sortKey") or (0, 0, 0, "")), reverse=True)
+    return {
+        "ok": True,
+        "version": DEVCTL_VERSION,
+        "configPath": str(devctl_global_config_path()),
+        "indexPath": str(devctl_inbox_index_path()),
+        "patchInboxDirs": [str(path) for path in inbox_root_dirs(config)],
+        "workspaces": [workspace_record_to_json(record) for record in config.get("workspaces", []) if isinstance(record, dict)],
+        "patches": {"count": len(items), "items": items},
+    }
+
+
+def choose_workspace_interactively(config: dict[str, Any]) -> dict[str, Any] | None:
+    records = [record for record in config.get("workspaces", []) if isinstance(record, dict)]
+    if not records or not sys.stdin.isatty():
+        return None
+    print("Patch target is unclear.")
+    print("Choose workspace:")
+    for index, record in enumerate(records, start=1):
+        print(f"{index}. {record.get('id')}    {record.get('path')}")
+    try:
+        raw = input("Selection: ").strip()
+        choice = int(raw)
+    except Exception:
+        return None
+    if choice < 1 or choice > len(records):
+        return None
+    return records[choice - 1]
+
+
+def move_inbox_original(path: Path, inbox_root: Path, bucket: str) -> Path:
+    target_dir = inbox_root / bucket
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = unique_destination(target_dir / path.name)
+    shutil.move(str(path), str(target))
+    return target
+
+
+def import_inbox_item(item: dict[str, Any], config: dict[str, Any], *, workspace_id: str | None, dry_run: bool) -> dict[str, Any]:
+    path = Path(str(item.get("path")))
+    sha256 = item.get("sha256") if isinstance(item.get("sha256"), str) else None
+    if not path.is_file():
+        raise DevctlError(f"patch.zip не найден: {path}")
+    if item.get("status") == "duplicate":
+        inbox_root = Path(str(item.get("primaryInboxRoot") or item.get("inboxRoot") or path.parent))
+        duplicate_path = None if dry_run else move_inbox_original(path, inbox_root, "duplicate")
+        return {
+            "ok": True,
+            "status": "duplicate",
+            "name": path.name,
+            "sha256": sha256,
+            "movedTo": str(duplicate_path) if duplicate_path else None,
+        }
+
+    target = item.get("target") if isinstance(item.get("target"), dict) else {}
+    record = registered_workspace_by_id(config, workspace_id) if workspace_id else None
+    confidence = "manual" if record else target.get("confidence")
+    if record is None:
+        if target.get("confidence") == "high" and isinstance(target.get("workspaceId"), str):
+            record = registered_workspace_by_id(config, str(target.get("workspaceId")))
+        if record is None and target.get("confidence") == "medium" and not dry_run:
+            record = choose_workspace_interactively(config)
+    if record is None:
+        raise DevctlError(
+            f"Не удалось однозначно определить workspace для {path.name}: {target.get('reason') or 'confidence low'}. "
+            "Используйте `devctl inbox grab --workspace <id>` или зарегистрируйте workspace."
+        )
+
+    workspace, workspace_error = workspace_record_project(record)
+    if workspace is None:
+        raise DevctlError(f"Зарегистрированный workspace недоступен: {workspace_error}")
+    workspace.patches_dir.mkdir(parents=True, exist_ok=True)
+    destination = workspace.patches_dir / path.name
+    if destination.exists():
+        existing_sha = sha256_file(destination)
+        if existing_sha == sha256:
+            raise DevctlError(f"Такой patch.zip уже лежит в workspace/patches/: {destination}")
+        raise DevctlError(f"Нельзя перезаписать существующий файл в patches/: {destination}")
+
+    inbox_root = Path(str(item.get("primaryInboxRoot") or item.get("inboxRoot") or path.parent))
+    if dry_run:
+        return {
+            "ok": True,
+            "status": "would_import",
+            "name": path.name,
+            "sha256": sha256,
+            "workspaceId": record.get("id"),
+            "confidence": confidence,
+            "copyTo": str(destination),
+            "moveOriginalTo": str(inbox_root / "imported" / path.name),
+        }
+
+    shutil.copy2(path, destination)
+    copied_sha = sha256_file(destination)
+    if sha256 and copied_sha != sha256:
+        try:
+            destination.unlink()
+        except OSError:
+            pass
+        raise DevctlError(f"SHA-256 копии не совпал: {destination}")
+    imported_path = move_inbox_original(path, inbox_root, "imported")
+
+    index = load_inbox_index()
+    event = {
+        "sha256": sha256,
+        "originalName": path.name,
+        "sourcePath": str(path),
+        "importedTo": str(destination),
+        "workspaceId": record.get("id"),
+        "workspacePath": record.get("path"),
+        "importedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "confidence": confidence,
+        "targetReason": target.get("reason"),
+        "movedOriginalTo": str(imported_path),
+    }
+    index.setdefault("imports", []).append(event)
+    save_inbox_index(index)
+    return {"ok": True, "status": "imported", **event}
+
+
+# ---------------------------------------------------------------------------
+# Patch Intake commands
+# ---------------------------------------------------------------------------
+
+
+def workspace_command(args: argparse.Namespace) -> int:
+    action = getattr(args, "workspace_action", None)
+    if action != "register":
+        raise DevctlError("Поддерживается только `devctl workspace register`")
+    workspace = discover_workspace_from_override(args.path)
+    validate_workspace_registerable(workspace)
+    config = load_global_config()
+    workspace_id = workspace_display_id(workspace, args.id)
+    name = workspace_display_name(workspace, args.name)
+    record, created = register_workspace_record(config, workspace, workspace_id, name)
+    save_global_config(config)
+    payload = {
+        "ok": True,
+        "created": created,
+        "configPath": str(devctl_global_config_path()),
+        "workspace": workspace_record_to_json(record),
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        print("Registered workspace:" if created else "Workspace already registered/updated:")
+        print(f"  id: {record.get('id')}")
+        print(f"  name: {record.get('name')}")
+        print(f"  path: {record.get('path')}")
+    return 0
+
+
+def inbox_command(args: argparse.Namespace) -> int:
+    action = getattr(args, "inbox_action", None)
+    config = load_global_config()
+    if action == "init":
+        root = expand_user_path(args.path).resolve()
+        ensure_inbox_dirs(root)
+        added = add_inbox_dir(config, root)
+        save_global_config(config)
+        payload = {
+            "ok": True,
+            "createdOrReused": True,
+            "addedToConfig": added,
+            "path": str(root),
+            "subdirs": {name: str(root / name) for name in INBOX_SUBDIRS},
+            "configPath": str(devctl_global_config_path()),
+        }
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False))
+        else:
+            print("Patch Inbox готов:")
+            for name in INBOX_SUBDIRS:
+                print(f"  {name}: {root / name}")
+            print(f"Config: {devctl_global_config_path()}")
+        return 0
+
+    if action == "scan":
+        payload = build_inbox_scan(config)
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False))
+        else:
+            print("Patch Inbox")
+            if not payload["patchInboxDirs"]:
+                print("Склад патчей не настроен. Выполните `devctl inbox init --path <dir>`." )
+            for index, item in enumerate(payload["patches"]["items"], start=1):
+                target = item.get("target") if isinstance(item.get("target"), dict) else {}
+                print(f"\n[{index}] {item.get('name')}")
+                print(f"    source: {item.get('sourceDir')}")
+                print(f"    status: {item.get('status')}")
+                print(f"    target: {target.get('workspaceId') or 'unknown'}")
+                print(f"    confidence: {target.get('confidence')}")
+                if item.get("manifestError"):
+                    print(f"    manifest: {item.get('manifestError')}")
+                if target.get("reason"):
+                    print(f"    reason: {target.get('reason')}")
+        return 0
+
+    if action == "grab":
+        payload = build_inbox_scan(config)
+        items = payload["patches"]["items"]
+        candidates = [item for item in items if item.get("status") in {"valid", "duplicate"}]
+        if not candidates:
+            raise DevctlError("В Patch Inbox нет валидных zip-патчей для импорта.")
+        selected = candidates if args.all else candidates[:1]
+        results: list[dict[str, Any]] = []
+        errors: list[str] = []
+        for item in selected:
+            try:
+                results.append(import_inbox_item(item, config, workspace_id=args.workspace, dry_run=args.dry_run))
+            except DevctlError as exc:
+                errors.append(str(exc))
+                if not args.all:
+                    raise
+        result_payload = {
+            "ok": not errors,
+            "dryRun": bool(args.dry_run),
+            "results": results,
+            "errors": errors,
+            "configPath": str(devctl_global_config_path()),
+            "indexPath": str(devctl_inbox_index_path()),
+        }
+        if args.json:
+            print(json.dumps(result_payload, ensure_ascii=False))
+        else:
+            for result in results:
+                if result.get("status") == "imported":
+                    print(f"Imported: {result.get('originalName')} -> {result.get('importedTo')}")
+                elif result.get("status") == "would_import":
+                    print(f"Would import: {result.get('name')} -> {result.get('copyTo')}")
+                elif result.get("status") == "duplicate":
+                    print(f"Duplicate: {result.get('name')} -> {result.get('movedTo') or 'оставлен на месте'}")
+            for error in errors:
+                print(f"[ОШИБКА] {error}")
+        return 0 if not errors else 2
+
+    raise DevctlError("Неизвестная команда inbox. Используйте init/scan/grab.")
 
 
 # ---------------------------------------------------------------------------
@@ -4511,7 +5149,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser._positionals.title = "команды"
     parser._optionals.title = "параметры"
-    subparsers = parser.add_subparsers(dest="command", required=True, metavar="{init,sync,status,inspect,plan,start,reset,completion,self}")
+    subparsers = parser.add_subparsers(dest="command", required=True, metavar="{init,sync,workspace,inbox,status,inspect,plan,start,reset,completion,self}")
 
     init = subparsers.add_parser("init", help="Создать или безопасно обновить структуру workspace")
     init.add_argument("--workspace", default=None, help="Корень рабочей области. По умолчанию текущий каталог.")
@@ -4536,6 +5174,28 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--clean-mode", choices=("fd", "fdx"), default="fd", help="Режим git clean для --discard-local. По умолчанию fd")
     sync.add_argument("--no-archive", action="store_true", help="Не создавать свежий архив после Git-синхронизации")
     sync.add_argument("--no-uts", action="store_true", help="Не разворачивать свежий архив в UserTestSpace")
+
+    workspace_cmd = subparsers.add_parser("workspace", help="Глобальный реестр workspace для Patch Intake")
+    workspace_sub = workspace_cmd.add_subparsers(dest="workspace_action", required=True, metavar="{register}")
+    workspace_register = workspace_sub.add_parser("register", help="Зарегистрировать workspace в глобальном config")
+    workspace_register.add_argument("path", nargs="?", default=".", help="Путь к workspace или project. По умолчанию текущий каталог.")
+    workspace_register.add_argument("--id", default=None, help="Короткий id workspace, например devctl")
+    workspace_register.add_argument("--name", default=None, help="Человекочитаемое имя workspace")
+    workspace_register.add_argument("--json", action="store_true", help="Вывести машинно-читаемый JSON")
+
+    inbox = subparsers.add_parser("inbox", help="Принять patch.zip из общего склада в нужный workspace")
+    inbox_sub = inbox.add_subparsers(dest="inbox_action", required=True, metavar="{init,scan,grab}")
+    inbox_init = inbox_sub.add_parser("init", help="Создать или подключить Patch Inbox")
+    inbox_init.add_argument("--path", required=True, help="Путь к основному складу патчей")
+    inbox_init.add_argument("--json", action="store_true", help="Вывести машинно-читаемый JSON")
+    inbox_scan = inbox_sub.add_parser("scan", help="Показать найденные patch.zip без изменения файлов")
+    inbox_scan.add_argument("--json", action="store_true", help="Вывести машинно-читаемый JSON")
+    inbox_grab = inbox_sub.add_parser("grab", help="Импортировать последний валидный patch.zip в workspace/patches/")
+    inbox_grab.add_argument("--latest", action="store_true", help="Явно выбрать самый свежий подходящий патч")
+    inbox_grab.add_argument("--all", action="store_true", help="Импортировать все однозначные патчи")
+    inbox_grab.add_argument("--dry-run", action="store_true", help="Показать действия без копирования и перемещения")
+    inbox_grab.add_argument("--workspace", default=None, help="Принудительно указать id зарегистрированного workspace")
+    inbox_grab.add_argument("--json", action="store_true", help="Вывести машинно-читаемый JSON")
 
     status = subparsers.add_parser("status", help="Показать состояние рабочей области/Git/патчей без изменений")
     status.add_argument("--json", action="store_true", help="Вывести машинно-читаемый JSON")
@@ -4587,6 +5247,10 @@ def main(argv: list[str] | None = None) -> int:
             return init_command(args)
         if args.command == "sync":
             return sync_command(args)
+        if args.command == "workspace":
+            return workspace_command(args)
+        if args.command == "inbox":
+            return inbox_command(args)
         if args.command == "status":
             return status_command(args)
         if args.command == "inspect":

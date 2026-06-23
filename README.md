@@ -16,6 +16,8 @@
 Начиная с v0.6.2, `init --upgrade` безопасно актуализирует уже существующий workspace: добавляет недостающие поля конфигурации, создаёт новые инфраструктурные папки вроде `UserTestSpace/` и не переписывает пользовательские пути.
 
 Начиная с v0.6.3, commit-guard различает опасные добавления/модификации generated/cache файлов и полезное удаление уже tracked Python bytecode/cache. `A/M/R/C/??` для `__pycache__/`, `*.pyc`, `*.pyo` по-прежнему блокируются, но чистое `D` разрешается как cleanup tracked-мусора.
+
+Начиная с v0.7.0, `devctl` умеет Patch Intake: `workspace register`, `inbox init`, `inbox scan` и `inbox grab` доставляют patch.zip из общего склада в правильный `workspace/patches/`, не применяя его автоматически.
 ```
 
 Манифест патча описывает содержимое и проверки. Политика рабочего процесса живёт в `.devctl/workspace.json`: именно рабочая область решает, нужно ли требовать чистое дерево, делать commit и push. Это защищает проект от случайного изменения правил внутри самого патча.
@@ -58,6 +60,22 @@ workspace/
   archives/             # снимки до/после/ошибки, логи и отчёты запусков
   UserTestSpace/        # грязные копии успешных post-снимков для ручного тестирования
 ```
+
+
+## Patch Intake
+
+Для патчей, полученных от ChatGPT/нейросети/человека, можно настроить общий склад и больше не перекладывать архивы вручную в `patches/`:
+
+```bash
+devctl workspace register . --id devctl --name "devctl universal"
+devctl inbox init --path "D:/PatchInbox"
+devctl inbox scan
+devctl inbox grab
+devctl plan
+devctl start
+```
+
+`inbox grab` только импортирует `patch.zip` в нужный `workspace/patches/`. Применение остаётся за обычными командами `plan/start`. Подробности: `docs/patch-intake.md`.
 
 ## Базовое правило Stage 0
 
