@@ -1,68 +1,86 @@
-# Patch Intake v0.1
+# Приём патчей из общего склада
 
-Patch Intake добавляет входной шлюз перед обычным `plan/start`.
-
-Новый цикл:
+Patch Intake избавляет от ручного перекладывания архивов: патчи, полученные от нейросети или
+человека, складываются в одну папку, а devctl сам доставляет каждый в `patches/` нужного workspace.
 
 ```text
-общий склад patch.zip -> devctl inbox grab -> workspace/patches/ -> devctl plan -> devctl start
+общий склад patch.zip → devctl inbox grab → workspace/patches/ → devctl plan → devctl start
 ```
 
-Функция не применяет патчи автоматически. Она только доставляет валидный `patch.zip` в правильный workspace.
+Приём только доставляет файл. `plan` и `start` он не запускает.
 
-## Глобальный config
-
-Пользовательский config хранится вне workspace:
-
-- Linux/macOS: `~/.config/devctl/config.json`
-- Windows: `%APPDATA%/devctl/config.json`
-
-Минимальный формат:
-
-```json
-{
-  "version": 1,
-  "patchInboxDirs": ["D:/PatchInbox"],
-  "workspaces": [
-    {"id": "devctl", "name": "devctl universal", "path": "D:/projects/devctl-workspace"}
-  ]
-}
-```
-
-## Команды
+## Настройка
 
 ```bash
-devctl workspace register . --id devctl --name "devctl universal"
-devctl inbox init --path "D:/PatchInbox"
-devctl inbox scan
-devctl inbox grab
+devctl workspace register . --id myapp --name "My App"   # в каждом workspace
+devctl inbox init --path ~/PatchInbox                    # один раз
 ```
 
-`inbox init` создаёт подпапки `incoming/`, `imported/`, `rejected/`, `duplicate/`.
+`workspace register [путь]` записывает workspace в пользовательский конфиг. У workspace должны быть
+`.devctl/workspace.json`, каталог проекта и `patches/`. Без `--id` идентификатор берётся из ключей
+`id`, `workspaceId`, `name` конфигурации workspace, без `--name` имя — из `name`, `projectName`, `id`,
+`workspaceId`; если их нет — из имени каталога workspace. Идентификатор всегда приводится к нижнему
+регистру, латинице, цифрам и дефисам. Повторная регистрация того же пути обновляет запись; один
+идентификатор нельзя занять двумя путями.
 
-`inbox scan` ничего не меняет: читает zip-кандидаты, проверяет `manifest.json`, считает SHA-256 и показывает предполагаемый target workspace.
+`inbox init` создаёт в складе подкаталоги и добавляет склад в конфиг:
 
-`inbox grab` копирует самый свежий валидный патч в `workspace/patches/`, проверяет SHA-256 копии, переносит оригинал в `imported/` и записывает событие в `~/.config/devctl/inbox_index.json`.
+| Подкаталог | Назначение |
+| --- | --- |
+| `incoming/` | сюда кладутся новые патчи |
+| `imported/` | оригиналы после успешного импорта |
+| `duplicate/` | патчи, которые уже импортировались раньше |
+| `rejected/` | зарезервирован |
 
-## Target в manifest.json
+Если у склада нет `incoming/`, патчи ищутся в его корне. Складов может быть несколько; оригиналы
+после импорта всегда уходят в `imported/` и `duplicate/` первого склада в конфиге, а `inbox init`
+ставит новый склад первым.
 
-Поле `target` необязательное. Старые патчи без него остаются валидными.
+## Работа
+
+```bash
+devctl inbox scan               # что лежит в складе и куда это пойдёт; ничего не меняет
+devctl inbox grab               # импортировать самый свежий подходящий патч
+devctl inbox grab --all         # импортировать все, цель которых определяется однозначно
+devctl inbox grab --dry-run     # показать действия без копирования
+devctl inbox grab --workspace myapp   # указать цель вручную
+```
+
+`grab` копирует патч в `patches/` целевого workspace, сверяет SHA-256 копии с оригиналом, переносит
+оригинал в `imported/` и записывает событие в `inbox_index.json`. Флаг `--latest` принимается для
+совместимости и ничего не меняет: самый свежий патч выбирается и без него.
+
+## Как определяется целевой workspace
+
+Подсказка в манифесте необязательна:
 
 ```json
 "target": {
-  "projectId": "devctl",
-  "workspaceId": "devctl",
-  "projectName": "devctl universal",
-  "expectedFiles": ["devctl.py", "README.md"]
+  "projectId": "myapp",
+  "workspaceId": "myapp",
+  "projectName": "My App",
+  "expectedFiles": ["pyproject.toml", "src/app.py"]
 }
 ```
 
-`projectId`/`workspaceId` не считаются абсолютной истиной: devctl дополнительно сверяет `expectedFiles` и файлы из payload с зарегистрированным workspace. Если уверенность низкая, CLI требует `--workspace <id>` или ручной выбор, а GUI показывает выбор workspace.
+Для каждого зарегистрированного workspace считаются совпадения: идентификатор, имя, существование
+файлов из `expectedFiles` и файлов самого патча в проекте.
 
-## Безопасность
+| Уверенность | Условие | Что делает `grab` |
+| --- | --- | --- |
+| высокая | совпал идентификатор или имя **и** нашлись файлы | импортирует |
+| средняя | идентификатор не совпал, но по файлам workspace однозначно лучший | спрашивает в терминале; без терминала — отказ |
+| низкая | совпал только идентификатор либо ничего | отказ; нужен `--workspace <id>` |
+
+Патч, который не проходит проверку манифеста и путей, не импортируется. Проверка путей здесь строже,
+чем у `start`: отклоняется и патч, в путях которого есть `.git`, `.devctl`, `target` или `node_modules`.
+
+## Предохранители
 
 - zip без `manifest.json` не импортируется;
-- имя файла не используется как единственный сигнал target;
-- дубликаты блокируются через SHA-256 индекс;
-- существующий файл в `workspace/patches/` не перезаписывается;
-- `inbox grab` никогда не запускает `plan` или `start` автоматически.
+- имя файла не считается признаком цели;
+- патч с уже встречавшимся SHA-256 считается дубликатом и уходит в `duplicate/`;
+- существующий файл в `patches/` не перезаписывается;
+- если SHA-256 копии не совпал с оригиналом, копия удаляется, оригинал остаётся на месте.
+
+Расположение пользовательского конфига и индекса — в [configuration.md](configuration.md).

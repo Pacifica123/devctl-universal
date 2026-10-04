@@ -1,140 +1,148 @@
-# devctl universal — конвейер ИИ-патчей
+# devctl — конвейер ИИ-патчей
 
-Этот репозиторий содержит минимальный универсальный инструмент `devctl`: безопасную «конвейерную ленту» для применения патчей, подготовленных ИИ или человеком. Его цель — превратить разработку в повторяемый поток: взять следующий патч, проверить его, применить, снова проверить, зафиксировать результат в Git, отправить изменения и оставить полный след в архивах/отчётах.
+`devctl` — один файл на чистом Python (`devctl.py`, только стандартная библиотека), который превращает
+разработку с нейросетью в повторяемый поток: изменения приходят zip-патчами, каждый патч проверяется,
+применяется, коммитится и оставляет после себя полный след — отчёт, логи, снимки проекта и копию для
+ручного тестирования.
 
-## Философия
+Версия: **0.8.0**. Журнал изменений — в [docs/CHANGELOG.md](docs/CHANGELOG.md).
 
-`devctl start` задуман как «волшебная кнопка» разработки:
+## Что он делает
 
 ```text
-найти последний неприменённый patch.zip -> проверить манифест -> сделать снимок до изменений -> применить файлы -> выполнить проверки -> commit -> push -> сделать снимок после изменений -> развернуть UserTestSpace -> записать отчёт
-
-Начиная с v0.6.0, при ошибке после частичного применения `start` работает как «пружина»: сначала сохраняет failed-архив для диагностики, затем автоматически выполняет откат рабочего дерева.
-
-Начиная с v0.6.1, `start` дополнительно игнорирует Python bytecode/cache внутри patch payload (`__pycache__/`, `*.pyc`, `*.pyo`) и очищает такие артефакты после применения и после проверок перед Git status/commit.
-
-Начиная с v0.6.2, `init --upgrade` безопасно актуализирует уже существующий workspace: добавляет недостающие поля конфигурации, создаёт новые инфраструктурные папки вроде `UserTestSpace/` и не переписывает пользовательские пути.
-
-Начиная с v0.6.3, commit-guard различает опасные добавления/модификации generated/cache файлов и полезное удаление уже tracked Python bytecode/cache. `A/M/R/C/??` для `__pycache__/`, `*.pyc`, `*.pyo` по-прежнему блокируются, но чистое `D` разрешается как cleanup tracked-мусора.
-
-Начиная с v0.7.0, `devctl` умеет Patch Intake: `workspace register`, `inbox init`, `inbox scan` и `inbox grab` доставляют patch.zip из общего склада в правильный `workspace/patches/`, не применяя его автоматически.
+patch.zip в patches/
+   │  devctl plan     посмотреть, что будет сделано, ничего не меняя
+   ▼
+devctl start
+   проверка манифеста и путей → предполётная проверка Git → снимок «до» →
+   удаления и наложение файлов → проверки из манифеста → commit → push →
+   снимок «после» → копия в UserTestSpace → report.md → запись в журнал
 ```
 
-Манифест патча описывает содержимое и проверки. Политика рабочего процесса живёт в `.devctl/workspace.json`: именно рабочая область решает, нужно ли требовать чистое дерево, делать commit и push. Это защищает проект от случайного изменения правил внутри самого патча.
+Если проверка не прошла, `start` сохраняет снимок сломанного состояния, откатывает проект
+(`git reset --hard HEAD` + `git clean -fd`) и убирает плохой патч из `patches/`. Откату нужен хотя бы
+один коммит в проекте.
 
+`devctl zip` (новое в 0.8.0) собирает всю историю workspace — коммиты, патчи, запуски, копии проекта и
+посторонние материалы вокруг него — в один небольшой архив, который можно целиком отдать нейросети.
 
-## Установка как CLI
+## Быстрый старт
 
-Начиная с v0.5 `devctl` можно поставить как обычную пользовательскую Linux-команду, а v0.5.1 добавляет метаданные установки для нормального обновления из исходного репозитория:
-
-```bash
-python3 devctl.py self install --with-completions
-# или
-./install.sh
-```
-
-После этого доступны:
+Нужны Python 3.9+ и Git. Версия 0.8.0 проверена на Python 3.11, 3.12 и 3.13.
 
 ```bash
+python3 devctl.py self install --with-completions   # или ./install.sh
 devctl --version
-devctl -w /path/to/workspace status
-devctl -w /path/to/workspace plan
-devctl -w /path/to/workspace start
-devctl completion bash
-devctl self update
+
+mkdir my-space && cd my-space
+devctl init --project project --create-project --git-init --branch main
+# положить patch_YYYYMMDD_HHMMSS_slug.zip в patches/
+devctl plan
+devctl start --no-push      # без --no-push после коммита выполняется git push
+devctl zip                  # история workspace одним архивом
 ```
 
-Для постоянного выбора рабочей области можно задать `DEVCTL_WORKSPACE=/path/to/workspace`. При установке с completions devctl записывает `~/.local/share/devctl/install.json`, поэтому последующий `devctl self update` знает, из какого `devctl.py` обновлять управляемую копию, и автоматически освежает ранее установленные completion-файлы. Подробности — в `docs/release-cli.md`.
+Без установки те же команды работают как `python3 devctl.py <команда>`.
 
-## Структура рабочей области
+## Рабочая область
 
 ```text
 workspace/
   .devctl/
-    workspace.json      # активная конфигурация devctl
-    state.json          # журнал запусков и применённых патчей
-  workspace.json        # человекочитаемое зеркало конфигурации, если нужно
-  devctl.py             # проектно-независимый конвейер патчей
-  project/              # Git-репозиторий с исходниками и документацией продукта
+    workspace.json      # конфигурация: где проект, патчи, архивы, политика push
+    state.json          # журнал запусков
+  project/              # Git-репозиторий проекта (имя и место задаёт projectDir)
   patches/              # входящие patch.zip
-  archives/             # снимки до/после/ошибки, логи и отчёты запусков
-  UserTestSpace/        # грязные копии успешных post-снимков для ручного тестирования
+  archives/             # по каталогу на запуск: report.md, logs/, снимки pre/post/failed
+  UserTestSpace/        # распакованные post-снимки для ручного тестирования
+  …                     # любые другие каталоги и файлы: devctl их не трогает, но `devctl zip` учитывает
 ```
 
+Проект может совпадать с корнем workspace (`"projectDir": "."`) — так устроен сам этот репозиторий:
+`patches/`, `archives/`, `UserTestSpace/` и `.devctl/state.json` тогда должны быть в `.gitignore`.
 
-## Patch Intake
+Workspace ищется от текущего каталога вверх по `.devctl/workspace.json`. Явно его задают `-w <путь>`
+или переменная `DEVCTL_WORKSPACE`.
 
-Для патчей, полученных от ChatGPT/нейросети/человека, можно настроить общий склад и больше не перекладывать архивы вручную в `patches/`:
+## Команды
 
-```bash
-devctl workspace register . --id devctl --name "devctl universal"
-devctl inbox init --path "D:/PatchInbox"
-devctl inbox scan
-devctl inbox grab
-devctl plan
-devctl start
-```
+| Команда | Что делает | Меняет файлы |
+| --- | --- | --- |
+| `devctl init` | создаёт workspace; `--upgrade` дополняет старый | да |
+| `devctl status` | состояние workspace, Git и очереди патчей | нет |
+| `devctl inspect [патч]` | разбор патча: манифест, файлы, проверки | нет |
+| `devctl plan [патч]` | план применения | нет |
+| `devctl start` | применяет последний неприменённый патч | да |
+| `devctl reset` | откатывает проект и убирает последний упавший патч | да |
+| `devctl sync` | подтягивает проект из remote, делает свежий снимок и копию UTS | да |
+| `devctl zip` | эволюционный архив workspace | только сам архив |
+| `devctl workspace register`, `devctl inbox …` | приём патчей из общего склада | да |
+| `devctl self …`, `devctl completion …` | установка утилиты и автодополнение | да |
 
-`inbox grab` только импортирует `patch.zip` в нужный `workspace/patches/`. Применение остаётся за обычными командами `plan/start`. Подробности: `docs/patch-intake.md`.
+Все флаги и коды возврата — в [docs/commands.md](docs/commands.md).
 
-## Базовое правило Stage 0
-
-Все будущие изменения проекта должны приходить в виде zip-патчей в `patches/` и применяться командой:
-
-```bash
-python devctl.py plan
-python devctl.py start
-```
-
-Каждое предложение патча должно явно отвечать на вопрос: как это изменение связано с реальным исходным якорем проекта в `archives/zapret-main.zip`?
-
-## Текущие решения bootstrap-этапа
-
-- `archives/zapret-main.zip` — обязательный продуктовый/исходный якорь.
-- `archives/docs.zip` и `archives/reference/*` — дополнительные справочные материалы.
-- `project/` должен быть Git-репозиторием на ветке `main` или другой ветке, выбранной политикой рабочей области.
-- `devctl start` — основная кнопка: применить патч, выполнить проверки, создать commit и сделать push.
-- `python devctl.py start --no-push` используется только для явных локальных или отладочных запусков.
-- `devctl reset` — аварийная кнопка: из корня workspace откатывает `project/` через `git reset --hard` и `git clean -fd`, а также может убрать последний плохой patch.zip.
-- `devctl init --upgrade` — безопасная переинициализация существующего workspace без удаления проекта, патчей, архивов и пользовательских настроек.
-- `UserTestSpace/` автоматически получает свежую копию успешного post-снимка после `start`; старые тестовые папки не удаляются.
-- `.devctl/workspace.json` управляет Git-политикой рабочей области: `autoCommit`, `autoPush`, remote, branch и требование актуальности ветки.
-
-## Полезные команды
-
-```bash
-python devctl.py status   # показать состояние рабочей области, Git и очереди патчей
-python devctl.py inspect  # посмотреть последний patch.zip без изменения файлов
-python devctl.py plan     # dry-run план применения патча
-python devctl.py start    # выполнить конвейер применения
-python devctl.py reset    # откатить project/ и убрать последний плохой патч, если он известен
-python devctl.py init --upgrade  # безопасно обновить структуру старого workspace
-cd project && git status -sb
-```
-
-## Формат патча
+## Патч
 
 ```text
 patch_YYYYMMDD_HHMMSS_slug.zip
-  manifest.json
-  files/
-    path/inside/project.ext
-  PATCH_SUMMARY.md      # опционально
-  reports/              # опционально
+  manifest.json         # обязателен
+  files/                # накладывается поверх проекта
+  PATCH_SUMMARY.md      # необязателен; попадает в эволюционный архив
 ```
 
-Минимальная идея: всё, что лежит в `files/`, накладывается поверх проекта, а `manifest.json` описывает метаданные, удаления, проверки, commit-сообщение и целевой push.
+Манифест описывает содержимое и проверки. Политику — коммитить ли, пушить ли — задаёт workspace:
+`commit.enabled=false` и `push.enabled=false` в манифесте игнорируются с предупреждением.
+Формат и правила — в [docs/patch-format.md](docs/patch-format.md), пример —
+[docs/patch-manifest.example.json](docs/patch-manifest.example.json).
+
+## Эволюционный архив
+
+```bash
+devctl zip                    # ≈ 512 КиБ текста, входит в окно 200 тыс. токенов
+devctl zip --level brief      # ≈ 256 КиБ
+devctl zip --level full       # ≈ 2 МиБ, для моделей с окном 1 млн токенов
+devctl zip --level max        # без ограничения: все диффы и тексты целиком
+```
+
+В корне workspace появляется `<имя>_evolution_<время>.zip` с `README.md`, `TIMELINE.md` и `steps/`.
+Одинаковые деревья файлов — коммит, копия в `UserTestSpace`, pre/post-снимок, ручная копия вроде
+`stables/v1` — считаются одним состоянием; каждое состояние описано отличием от предыдущего; заметки и
+прочие материалы стоят в той же хронологии по времени изменения. При разработке 0.8.0 на
+синтетическом workspace в 2,1 ГиБ (110 патчей, 357 копий проекта) архив уровня `normal` занял около
+215 КиБ и собирался 8 секунд.
+Секреты из содержимого `devctl zip` не вычищает: архив повторяет то, что лежит в workspace.
+
+Устройство, формат и ограничения — в [docs/evolution-archive.md](docs/evolution-archive.md).
 
 ## Предохранители
 
-- Патч должен иметь корректный `manifest.json`.
-- Пути внутри архива обязаны быть относительными POSIX-путями.
-- Небезопасные каталоги вроде `.git`, `node_modules`, `target` и секретные `.env*` защищены от опасных операций; Python bytecode/cache (`__pycache__/`, `*.pyc`, `*.pyo`) автоматически игнорируется или очищается внутри `start`.
-- Перед применением проверяется чистота Git-дерева.
-- До и после запуска создаются snapshot-архивы проекта.
-- При ошибке после частичного применения создаётся failed-архив, а рабочее дерево автоматически откатывается, если локальный commit ещё не создан.
-- Python bytecode/cache из patch payload не копируется, а сгенерированный проверками bytecode удаляется перед commit.
-- После успешного запуска post-снимок разворачивается в `UserTestSpace/<version>/project` для ручного тестирования без загрязнения архивов.
-- Старые workspace можно обновлять командой `python devctl.py init --upgrade`: она добавляет только недостающую инфраструктуру и не трогает содержимое `project/`.
+- Пути в патче — только относительные POSIX-пути внутри проекта. Записать что-либо в `.git` или
+  принести файл `.env` / `.env.*` патч не может; удалить `.git`, `.devctl`, `node_modules`, `target` —
+  тоже.
+- `start` требует чистое рабочее дерево и, если push включён, совпадение локальной ветки с remote.
+- Python bytecode (`__pycache__/`, `*.pyc`, `*.pyo`) из патча не копируется и удаляется после проверок.
+- Перед коммитом `start` просматривает `git status` и останавливается, если видит там
+  сгенерированные или локальные файлы: `node_modules`, `target`, базы `*.db`/`*.sqlite`, каталоги с
+  именами `patches`, `archives`, `UserTestSpace`. Проверка смотрит на строки `git status`, поэтому
+  такие файлы внутри целиком нового каталога она не замечает — см. [docs/pipeline.md](docs/pipeline.md).
+- Снимки `pre`/`post`/`failed` не содержат `.git`, зависимостей, сборочных каталогов, `.env` и `.env.*`.
 
-См. также подробную документацию в `docs/devctl-universal-v0.3-README.md` и примеры манифеста/рабочей области в `docs/`.
+## Документация
+
+- [docs/commands.md](docs/commands.md) — справочник команд.
+- [docs/pipeline.md](docs/pipeline.md) — как работает `start`: шаги, статусы, каталог запуска, откат.
+- [docs/patch-format.md](docs/patch-format.md) — формат патча и манифеста.
+- [docs/configuration.md](docs/configuration.md) — `.devctl/workspace.json`, `state.json`, глобальный конфиг.
+- [docs/evolution-archive.md](docs/evolution-archive.md) — `devctl zip`.
+- [docs/patch-intake.md](docs/patch-intake.md) — приём патчей из общего склада.
+- [docs/release-cli.md](docs/release-cli.md) — установка, обновление, автодополнение.
+- [docs/CHANGELOG.md](docs/CHANGELOG.md) — история версий.
+
+## Проверка самого devctl
+
+```bash
+python -B -m unittest discover -s tests -v
+```
+
+Тесты используют только стандартную библиотеку и Git; они строят временный workspace через настоящий
+`devctl start` и проверяют на нём `devctl zip`.

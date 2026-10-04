@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """
-devctl v0.7.0 — проектно-независимый конвейер применения ИИ-патчей на чистом Python.
+devctl v0.8.0 — проектно-независимый конвейер применения ИИ-патчей на чистом Python.
 
 Базовый поток конвейера: применить патч -> выполнить проверки -> создать коммит -> отправить в remote.
 
-Команды:
-    python tools/devctl.py init --project ./project
-    python tools/devctl.py status
-    python tools/devctl.py inspect
-    python tools/devctl.py plan
-    python tools/devctl.py start
-    python tools/devctl.py reset
+Команды (подробности: `devctl <команда> --help` и docs/commands.md):
+    devctl init | sync            создать, обновить или синхронизировать workspace
+    devctl status | inspect | plan   посмотреть состояние и патч без изменений
+    devctl start | reset          применить патч или откатить проект
+    devctl zip                    собрать эволюционный архив workspace для чтения нейросетью
+    devctl workspace | inbox      приём патчей из общего склада
+    devctl self | completion      установка утилиты и shell completion
 
 Инструмент намеренно использует только стандартную библиотеку Python.
 """
 from __future__ import annotations
 
 import argparse
+import difflib
 import fnmatch
 import hashlib
 import json
@@ -27,12 +28,13 @@ import subprocess
 import sys
 import time
 import zipfile
+import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-DEVCTL_VERSION = "0.7.0"
+DEVCTL_VERSION = "0.8.0"
 STATE_VERSION = 1
 DEFAULT_PROJECT_DIR_NAME = "project"
 DEFAULT_PATCHES_DIR_NAME = "patches"
@@ -1760,7 +1762,7 @@ def validate_git_preflight(
         ctx.push_remote = remote
         ctx.push_branch = branch
         ctx.push_policy_note = note
-        if "ignored" in note:
+        if "проигнорирован" in note:
             ctx.warnings.append(note)
 
     if not push_enabled:
@@ -4560,6 +4562,2354 @@ def sync_command(args: argparse.Namespace) -> int:
         return 2
 
 # ---------------------------------------------------------------------------
+# Evolution digest (devctl zip)
+# ---------------------------------------------------------------------------
+#
+# `devctl zip` превращает весь workspace в один небольшой архив для чтения
+# нейросетью. Идея сжатия:
+#
+#   1. Всё, что похоже на проект (Git-коммиты, UserTestSpace, pre/post-архивы,
+#      ручные копии вроде stables/), сводится к деревьям «путь -> хэш содержимого».
+#      Одинаковые деревья сливаются в одно состояние с несколькими свидетелями,
+#      поэтому сто копий одного и того же стоят одну строку.
+#   2. Уникальные состояния выстраиваются в цепочку по времени; каждое
+#      описывается только отличием от предыдущего.
+#   3. Отличия сворачиваются по смыслу: переименования, массовые добавления,
+#      изменения одних хэшей, бинарные файлы.
+#   4. Всё остальное содержимое workspace попадает в ту же хронологию по времени
+#      файлов: заметки — текстом, тяжёлые каталоги и архивы — описью.
+#   5. Объём текста подгоняется под бюджет одним коэффициентом детализации:
+#      свежие шаги и исходный код получают больше строк, старые и объёмные — меньше.
+#      Опущенное всегда помечено и адресуемо (путь, хэш, коммит).
+
+EVO_FORMAT_VERSION = 1
+EVO_ARCHIVE_INFIX = "_evolution_"
+# Бюджет всего текста архива в КиБ. При ~3.2 байта на токен: brief ≈ 80 тыс. токенов,
+# normal ≈ 160 тыс. (входит в окно 200 тыс.), full ≈ 650 тыс. (окно 1 млн).
+EVO_LEVELS = {"brief": 256, "normal": 512, "full": 2048, "max": 0}
+EVO_TIER_NARRATIVE, EVO_TIER_MAIN, EVO_TIER_BULK = 0, 1, 2
+EVO_NARRATIVE_SHARE = 0.6
+EVO_BULK_RESERVE = 0.1
+EVO_UTS_MTIME_SLACK = 600  # секунд: файлы чистой копии UserTestSpace не моложе её метки
+EVO_DEFAULT_LEVEL = "normal"
+EVO_BASE_CAP_LINES = 240
+EVO_DETAIL_CEILING = 4096.0
+EVO_MAX_LINE_CHARS = 320
+EVO_CUT_SLACK_LINES = 6
+EVO_ADDED_WEIGHT = 0.4
+EVO_SNIFF_BYTES = 8192
+EVO_OPEN_ZIP_LIMIT = 16
+EVO_FULL_HASH_LIMIT = 64 * 1024 * 1024
+EVO_DIFF_SIZE_LIMIT = 1_500_000
+EVO_NOTE_SIZE_LIMIT = 256 * 1024
+EVO_SNAPSHOT_ZIP_LIMIT = 2 * 1024 * 1024 * 1024
+EVO_BULK_ADD_THRESHOLD = 25
+EVO_SMALL_DIR_FILES = 40
+EVO_BIG_DIR_FILES = 150
+EVO_DIFF_CONTEXT = 2
+EVO_JUNK_DIR_NAMES = {
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "node_modules", ".venv", "venv", ".tox", ".idea", ".vscode",
+}
+EVO_CODE_SUFFIXES = {
+    ".py", ".pyi", ".sh", ".bash", ".zsh", ".fish", ".ps1", ".bat", ".cmd", ".c", ".h", ".cc", ".cpp", ".hpp", ".rs", ".go",
+    ".js", ".jsx", ".mjs", ".ts", ".tsx", ".java", ".kt", ".cs", ".lua", ".rb", ".php", ".swift", ".sql", ".pl", ".mk", ".cmake",
+}
+EVO_DOC_SUFFIXES = {".md", ".rst", ".txt", ".adoc"}
+EVO_NOTE_SUFFIXES = EVO_DOC_SUFFIXES | {".org"}
+EVO_TIMESTAMP_RE = re.compile(r"(?<!\d)(\d{8})[_-](\d{6})(?!\d)")
+EVO_SEE_LOG_RE = re.compile(r" \(см\. [^)]*\)")
+EVO_UTS_NAME_RE = re.compile(r"^project_\d{8}_\d{6}_after_")
+EVO_SNAPSHOT_NAME_RE = re.compile(r"^(?:pre|post|failed)_.+_\d{8}_\d{6}_(?:before|after|failed)_.*\.zip$", re.IGNORECASE)
+EVO_RUN_DIR_RE = re.compile(r"^(\d{8}_\d{6})_(.+)_([0-9a-f]{7,40}|unknown)(?:_\d+)?$")
+EVO_HEX_RUN_RE = re.compile(r"[0-9a-fA-F]{16,}|[A-Za-z0-9+/]{40,}={0,2}")
+EVO_DECL_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:async\s+)?def\s+\w+|class\s+\w+"
+    r"|(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*\w+"
+    r"|(?:pub(?:\([a-z]+\))?\s+)?(?:async\s+)?(?:fn|struct|enum|trait|impl|mod)\s+\w+[^;]*$"
+    r"|func\s+(?:\([^)]*\)\s*)?\w+"
+    r"|(?:function\s+)?[A-Za-z_][\w\-]*\s*\(\)\s*\{"
+    r")"
+)
+EVO_HEADING_RE = re.compile(r"^#{1,4}\s+\S")
+EVO_TRAILER_RE = re.compile(r"^(Patch-Id|Patch-SHA256|Devctl-Version):\s*(.+?)\s*$", re.MULTILINE)
+EVO_MOD128 = 1 << 128
+
+
+def evo_progress(message: str, *, quiet: bool = False) -> None:
+    if not quiet:
+        print(message, file=sys.stderr, flush=True)
+
+
+def evo_git_blob_id(data: bytes) -> str:
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def evo_is_text_bytes(data: bytes) -> bool:
+    sample = data[:EVO_SNIFF_BYTES]
+    if b"\0" in sample:
+        return False
+    try:
+        sample.decode("utf-8")
+        return True
+    except UnicodeDecodeError as exc:
+        # Обрезанный посреди символа хвост выборки не делает файл бинарным.
+        if exc.start >= len(sample) - 4:
+            return True
+    printable = sum(1 for byte in sample if byte >= 32 or byte in (9, 10, 13))
+    return bool(sample) and printable / len(sample) > 0.95
+
+
+def evo_decode(data: bytes) -> str:
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        for encoding in ("cp1251", "latin-1"):
+            try:
+                return data.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+    return data.decode("utf-8", errors="replace")
+
+
+def evo_content_key(data: bytes, git_ids: set[str]) -> str:
+    """Ключ содержимого, совместимый с идентификаторами Git blob.
+
+    Перенос между ОС часто меняет только окончания строк, поэтому текст с CRLF
+    приводится к LF, если именно такого blob нет в истории Git.
+    """
+    raw = evo_git_blob_id(data)
+    if raw in git_ids or b"\r\n" not in data or not evo_is_text_bytes(data):
+        return raw
+    return evo_git_blob_id(data.replace(b"\r\n", b"\n"))
+
+
+def evo_large_key(size: int) -> str:
+    """Очень большой файл опознаётся только по размеру.
+
+    Ключ обязан быть одним и тем же для файла на диске, члена zip и blob в Git, иначе каждая
+    копия проекта с таким файлом выглядела бы изменённой; а читать ради этого гигабайты незачем.
+    """
+    return f"L{size:x}"
+
+
+def evo_file_key(path: Path, size: int, git_ids: set[str]) -> str:
+    if size > EVO_FULL_HASH_LIMIT:
+        return evo_large_key(size)
+    return evo_content_key(path.read_bytes(), git_ids)
+
+
+def evo_entry_hash(path: str, key: str) -> int:
+    return int.from_bytes(hashlib.sha1(f"{path}\0{key}".encode("utf-8", "surrogatepass")).digest()[:16], "big")
+
+
+def evo_tree_id(tree: dict[str, str]) -> int:
+    total = 0
+    for path, key in tree.items():
+        total = (total + evo_entry_hash(path, key)) % EVO_MOD128
+    return total
+
+
+def evo_local_tz() -> timezone:
+    offset = datetime.now().astimezone().utcoffset()
+    return timezone(offset) if offset is not None else timezone.utc
+
+
+def evo_format_time(epoch: float | None) -> str:
+    if not epoch:
+        return "время неизвестно"
+    return datetime.fromtimestamp(epoch, tz=evo_local_tz()).strftime("%Y-%m-%d %H:%M")
+
+
+def evo_time_from_name(name: str) -> float | None:
+    """Метки YYYYMMDD_HHMMSS devctl пишет по локальному времени машины."""
+    match = EVO_TIMESTAMP_RE.search(name)
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1) + match.group(2), "%Y%m%d%H%M%S").timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def evo_slug(value: str | None, fallback: str = "event") -> str:
+    """Как slugify, но буквы любых алфавитов сохраняются: имена на кириллице остаются узнаваемыми."""
+    text = re.sub(r"[^\w.-]+", "-", (value or "").strip().lower())
+    text = re.sub(r"-+", "-", text).strip("-._")
+    return text or fallback
+
+
+def evo_clip(text: str, limit: int = EVO_MAX_LINE_CHARS) -> str:
+    text = text.rstrip("\r\n")
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}…[+{len(text) - limit} симв.]"
+
+
+def evo_one_line(text: str | None, limit: int = 300) -> str:
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
+
+
+def evo_strip_url_credentials(url: str | None) -> str | None:
+    if not url:
+        return url
+    return re.sub(r"(?<=://)[^/@\s]+@", "", url)
+
+
+class EvoBlobStore:
+    """Достаёт содержимое по ключу: из Git, с диска или из zip-снимка."""
+
+    def __init__(self, project_root: Path, git_ids: set[str]) -> None:
+        self.project_root = project_root
+        self.git_ids = git_ids
+        self.disk: dict[str, Path] = {}
+        self.zipped: dict[str, tuple[Path, str]] = {}
+        self.memory: dict[str, bytes] = {}
+        self.sizes: dict[str, int] = {}
+        self._cat: subprocess.Popen[bytes] | None = None
+        self._zips: dict[Path, zipfile.ZipFile] = {}
+
+    def add_disk(self, key: str, path: Path, size: int) -> None:
+        self.disk.setdefault(key, path)
+        self.sizes.setdefault(key, size)
+
+    def add_zip(self, key: str, archive: Path, member: str, size: int) -> None:
+        self.zipped.setdefault(key, (archive, member))
+        self.sizes.setdefault(key, size)
+
+    def _read_git(self, key: str) -> bytes | None:
+        try:
+            if self._cat is None or self._cat.poll() is not None:
+                self._cat = subprocess.Popen(
+                    ["git", "cat-file", "--batch"], cwd=str(self.project_root),
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                )
+            assert self._cat.stdin is not None and self._cat.stdout is not None
+            self._cat.stdin.write(key.encode("ascii") + b"\n")
+            self._cat.stdin.flush()
+            header = self._cat.stdout.readline().split()
+            if len(header) < 3 or header[1] != b"blob":
+                return None
+            size = int(header[2])
+            data = self._cat.stdout.read(size)
+            self._cat.stdout.read(1)
+            self.sizes.setdefault(key, size)
+            return data
+        except (OSError, ValueError, AssertionError):
+            self._cat = None
+            return None
+
+    def read(self, key: str | None, limit: int | None = None) -> bytes | None:
+        if not key:
+            return None
+        if key in self.memory:
+            return self.memory[key]
+        size = self.sizes.get(key)
+        if limit is not None and size is not None and size > limit:
+            return None
+        if key in self.git_ids:
+            data = self._read_git(key)
+            if data is not None:
+                return data if limit is None or len(data) <= limit else None
+        path = self.disk.get(key)
+        if path is not None:
+            try:
+                return path.read_bytes()
+            except OSError:
+                pass
+        if key in self.zipped:
+            archive, member = self.zipped[key]
+            try:
+                if archive not in self._zips:
+                    while len(self._zips) >= EVO_OPEN_ZIP_LIMIT:
+                        # Снимков бывают тысячи, а открытых файлов процессу разрешено немного.
+                        self._zips.pop(next(iter(self._zips))).close()
+                    self._zips[archive] = zipfile.ZipFile(archive, "r")
+                return self._zips[archive].read(member)
+            except (OSError, KeyError, zipfile.BadZipFile, RuntimeError):
+                pass
+        return None
+
+    def size(self, key: str | None) -> int | None:
+        if key and key.startswith("L"):
+            return int(key[1:], 16)
+        return self.sizes.get(key) if key else None
+
+    def close(self) -> None:
+        if self._cat is not None:
+            try:
+                if self._cat.stdin is not None:
+                    self._cat.stdin.close()
+                self._cat.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                self._cat.kill()
+            self._cat = None
+        for handle in self._zips.values():
+            handle.close()
+        self._zips.clear()
+
+
+@dataclass
+class EvoChange:
+    status: str  # A, M, D, R
+    path: str
+    old_key: str | None = None
+    new_key: str | None = None
+    old_path: str | None = None
+
+
+@dataclass
+class EvoPatch:
+    rel: str
+    name: str
+    sha256: str
+    time: float
+    time_source: str
+    manifest: dict[str, Any] | None = None
+    manifest_error: str | None = None
+    summary_md: str = ""
+    overlay: dict[str, str] = field(default_factory=dict)
+    deletes: list[str] = field(default_factory=list)
+    step: int | None = None
+    link: str = ""
+    in_run: bool = False  # патч описан внутри события своего неудачного запуска
+
+    @property
+    def patch_id(self) -> str:
+        return str((self.manifest or {}).get("patchId") or Path(self.name).stem)
+
+    @property
+    def title(self) -> str:
+        return str((self.manifest or {}).get("title") or "")
+
+
+@dataclass
+class EvoRun:
+    rel: str
+    time: float
+    status: str
+    kind: str = "start"
+    patch_id: str | None = None
+    patch_sha256: str | None = None
+    patch_file: str | None = None
+    title: str | None = None
+    commit: str | None = None
+    checks: list[tuple[str, str, str]] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    fail_tail: list[str] = field(default_factory=list)
+    step: int | None = None
+    archived: bool = True
+    patch: Any = None  # EvoPatch неудачного запуска, если файл патча сохранился
+
+
+@dataclass
+class EvoCopy:
+    rel: str
+    origin: str  # dir | zip
+    tree: dict[str, str]
+    sizes: dict[str, int]
+    time: float
+    time_source: str
+    infra: bool
+    skipped_files: int = 0
+    skipped_bytes: int = 0
+    tree_id: int = 0
+    step: int | None = None
+    exact: bool = False
+    overlap: float = 0.0
+    changes: list[EvoChange] = field(default_factory=list)
+    last_mtime: float | None = None
+    devctl_made: bool = False  # имя выдано самим devctl: копия UserTestSpace или снимок запуска
+
+    @property
+    def state_tag(self) -> str:
+        """`<slug>_<sha7>` из имени копии devctl: по нему копия и архив одного состояния узнают друг друга."""
+        name = self.rel.rsplit("/", 2)[-2] if self.origin == "dir" and "/" in self.rel else self.rel.rsplit("/", 1)[-1]
+        _head, found, tail = name.partition("_after_")
+        return tail.removesuffix(".zip") if found else ""
+
+
+@dataclass
+class EvoLoose:
+    rel: str
+    kind: str  # file | dir | zip
+    size: int
+    time: float
+    time_end: float | None = None
+    files: int = 1
+    is_text: bool = False
+    path: Path | None = None
+    detail: list[str] = field(default_factory=list)
+
+
+@dataclass
+class EvoStep:
+    index: int
+    kind: str  # commit | snapshot | worktree
+    time: float
+    time_source: str
+    label: str
+    commit: str | None = None
+    body: str = ""
+    author: str = ""
+    changes: list[EvoChange] = field(default_factory=list)
+    tree: dict[str, str] | None = None
+    filtered_id: int = 0
+    witnesses: list[str] = field(default_factory=list)
+    patches: list[EvoPatch] = field(default_factory=list)
+    runs: list[EvoRun] = field(default_factory=list)
+    copies: list[EvoCopy] = field(default_factory=list)
+
+
+@dataclass
+class EvoItem:
+    """Кусок содержимого, объём которого подгоняется под бюджет."""
+
+    title: str
+    lines: list[str]
+    weight: float
+    outline: list[str] = field(default_factory=list)
+    fence: str = "diff"
+    note: str = ""
+    tier: int = EVO_TIER_MAIN
+    costs: list[int] = field(default_factory=list)
+
+    def prepare(self) -> None:
+        total = 0
+        self.costs = [0]
+        for line in self.lines:
+            total += len(line.encode("utf-8")) + 1
+            self.costs.append(total)
+
+    def head_min(self) -> int:
+        # У связного текста важнее всего начало, у кода — перечень затронутых объявлений.
+        return 3 if self.tier == EVO_TIER_NARRATIVE else 8
+
+    def cap(self, detail: float) -> int:
+        if detail >= EVO_DETAIL_CEILING:
+            return len(self.lines)  # бюджет не ограничен или всё поместилось: тело идёт целиком
+        cap = int(EVO_BASE_CAP_LINES * self.weight * detail)
+        # Обрывать ради нескольких строк бессмысленно: пометка об обрыве длиннее их самих.
+        return len(self.lines) if cap >= self.head_min() and 0 < len(self.lines) - cap <= EVO_CUT_SLACK_LINES else cap
+
+    def cost(self, detail: float) -> int:
+        cap = self.cap(detail)
+        outline_cost = sum(len(item.encode("utf-8")) + 2 for item in self.outline[:12]) + 40 if self.outline else 0
+        if len(self.lines) <= cap:
+            return self.costs[-1] + 16
+        if cap >= self.head_min():
+            return self.costs[cap] + outline_cost + 96
+        if cap >= 2:
+            return outline_cost
+        return 0
+
+    def render(self, detail: float) -> list[str]:
+        cap = self.cap(detail)
+        if not self.lines:
+            return []
+        if len(self.lines) <= cap:
+            return [f"````{self.fence}", *self.lines, "````"]
+        label = "затронуто" if self.fence == "diff" else "структура"
+        outline = f"{label}: {'; '.join(self.outline[:12])}" if self.outline else ""
+        if cap >= self.head_min():
+            tail = f"… опущено строк: {len(self.lines) - cap} из {len(self.lines)}"
+            return [f"````{self.fence}", *self.lines[:cap], "````", tail + (f"; {outline}" if outline else "")]
+        if cap >= 2 and outline:
+            return [f"({outline}; строк: {len(self.lines)})"]
+        return []
+
+
+def evo_read_git_history(project_root: Path) -> tuple[list[EvoStep], set[str], dict[str, Any]]:
+    """Первая родительская линия HEAD: коммиты с изменениями относительно родителя."""
+    info: dict[str, Any] = {"available": False, "commits": 0, "head": None, "branch": None, "remoteUrl": None, "otherRefs": 0}
+    if not git_available() or not (project_root / ".git").exists() or not has_git_commit(project_root):
+        return [], set(), info
+    fmt = "%x01%H%x00%P%x00%ct%x00%an%x00%B%x02"
+    result = git(
+        project_root,
+        ["-c", "core.quotepath=off", "log", "--first-parent", "--reverse", "-m", "--raw", "-z", "--no-abbrev",
+         "--no-renames", "--root", f"--format={fmt}", "HEAD"],
+        timeout=1800,
+    )
+    if result.returncode != 0:
+        raise DevctlError(f"git log завершился ошибкой: {command_error_summary(result)}")
+    steps: list[EvoStep] = []
+    git_ids: set[str] = set()
+    for chunk in result.stdout.split("\x01")[1:]:
+        header, _sep, raw = chunk.partition("\x02")
+        fields = header.split("\x00", 4)
+        if len(fields) < 5:
+            continue
+        sha, _parents, committed, author, message = fields
+        subject, _nl, body = message.strip().partition("\n")
+        try:
+            when = float(committed)
+        except ValueError:
+            when = 0.0
+        step = EvoStep(
+            index=len(steps), kind="commit", time=when, time_source="git", label=subject.strip(),
+            commit=sha, body=body.strip(), author=author,
+        )
+        tokens = raw.split("\x00")
+        position = 0
+        while position < len(tokens):
+            token = tokens[position].lstrip("\n")
+            position += 1
+            if not token.startswith(":"):
+                continue
+            meta = token.split()
+            if len(meta) < 5 or position >= len(tokens):
+                continue
+            path = tokens[position]
+            position += 1
+            new_mode, old_id, new_id, status = meta[1], meta[2], meta[3], meta[4][:1]
+            old_key = None if set(old_id) == {"0"} else old_id
+            new_key = None if set(new_id) == {"0"} else new_id
+            if new_key and new_mode == "160000":
+                new_key = "gitlink:" + new_key
+            if status == "T":
+                status = "M"
+            if status in {"A", "M", "D"}:
+                step.changes.append(EvoChange(status, path, old_key, new_key))
+                for key in (old_key, new_key):
+                    if key and not key.startswith("gitlink:"):
+                        git_ids.add(key)
+        steps.append(step)
+    large = evo_git_large_blobs(project_root, git_ids)
+    if large:
+        for step in steps:
+            for change in step.changes:
+                change.old_key = large.get(change.old_key or "", change.old_key)
+                change.new_key = large.get(change.new_key or "", change.new_key)
+    authors: dict[str, int] = {}
+    for step in steps:
+        authors[step.author or ""] = authors.get(step.author or "", 0) + 1
+    info.update({
+        "available": True, "commits": len(steps), "head": steps[-1].commit if steps else None,
+        "mainAuthor": max(authors, key=lambda name: authors[name]) if authors else None,
+    })
+    try:
+        info["branch"] = git_branch(project_root)
+    except DevctlError:
+        info["branch"] = None
+    info["remoteUrl"] = evo_strip_url_credentials(git_remote_url(project_root, "origin"))
+    refs = git(project_root, ["for-each-ref", "--format=%(refname)", "refs/heads", "refs/tags"])
+    if refs.returncode == 0:
+        info["otherRefs"] = max(len([line for line in refs.stdout.splitlines() if line.strip()]) - 1, 0)
+    return steps, git_ids, info
+
+
+def evo_git_large_blobs(project_root: Path, git_ids: set[str]) -> dict[str, str]:
+    """Blob-ы больше порога полного сравнения: идентификатор -> ключ «по размеру»."""
+    if not git_ids:
+        return {}
+    try:
+        completed = subprocess.run(
+            ["git", "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
+            input=("\n".join(sorted(git_ids)) + "\n").encode("ascii"), cwd=str(project_root),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=600, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    result: dict[str, str] = {}
+    for line in safe_decode(completed.stdout).splitlines():
+        fields = line.split()
+        if len(fields) == 3 and fields[1] == "blob" and fields[2].isdigit() and int(fields[2]) > EVO_FULL_HASH_LIMIT:
+            result[fields[0]] = evo_large_key(int(fields[2]))
+    return result
+
+
+class EvoScan:
+    """Один проход по workspace: копии проекта, патчи, запуски и всё остальное."""
+
+    def __init__(self, workspace: Workspace, git_ids: set[str], blobs: EvoBlobStore, signature: set[str], quiet: bool) -> None:
+        self.workspace = workspace
+        self.git_ids = git_ids
+        self.blobs = blobs
+        self.signature = signature
+        self.signature_min = max(2, min(3, len(signature)))
+        self.quiet = quiet
+        self.excludes = workspace_archive_excludes(workspace)
+        self.copies: list[EvoCopy] = []
+        self.patches: list[EvoPatch] = []
+        self.runs: list[EvoRun] = []
+        self.loose_files: list[EvoLoose] = []
+        self.project_files: set[str] = set()
+        self.project_dirs: set[str] = set()
+        self.total_files = 0
+        self.total_bytes = 0
+        self.junk_files = 0
+        self.junk_bytes = 0
+        self.own_archives = 0
+        self.warnings: list[str] = []
+        self.zip_keys: dict[tuple[int, int], str] = {}
+        self.filter_cache: dict[str, bool] = {}
+        self.same_root = workspace.project_root.resolve() == workspace.workspace_root.resolve()
+        self.infra_roots = {
+            workspace.patches_dir.resolve(), workspace.archives_dir.resolve(), workspace.uts_dir.resolve(),
+        }
+
+    # -- helpers ------------------------------------------------------------
+
+    def rel(self, path: Path) -> str:
+        try:
+            return path.relative_to(self.workspace.workspace_root).as_posix()
+        except ValueError:
+            return path.as_posix()
+
+    def is_filtered(self, rel_path: str) -> bool:
+        """Пути, которые devctl сам не кладёт в снимки: их нельзя сравнивать между копиями."""
+        cached = self.filter_cache.get(rel_path)
+        if cached is None:
+            # Одни и те же пути встречаются в сотнях копий: ответ считается один раз.
+            name = rel_path.rsplit("/", 1)[-1]
+            cached = bool(
+                name in {RELEASE_ZIP_PLACEHOLDER, RELEASE_EXE_PLACEHOLDER} or release_payload_omission_kind(rel_path)
+                or is_python_bytecode_artifact(rel_path) or any(part in EVO_JUNK_DIR_NAMES for part in rel_path.split("/"))
+                or should_exclude_from_archive(rel_path, self.excludes)
+            )
+            self.filter_cache[rel_path] = cached
+        return cached
+
+    def matches_signature(self, names: Iterable[str]) -> bool:
+        visible = {name for name in names if name not in EVO_JUNK_DIR_NAMES and name != ".git"}
+        if not visible or not self.signature:
+            return False
+        hits = len(visible & self.signature)
+        return hits >= self.signature_min and hits * 2 >= len(visible)
+
+    def is_uts_copy(self, path: Path) -> bool:
+        parent = path.parent
+        return (
+            path.name == "project" and bool(EVO_UTS_NAME_RE.match(parent.name))
+            and parent.parent.resolve() == self.workspace.uts_dir.resolve()
+        )
+
+    def under_infra(self, path: Path) -> bool:
+        resolved = path.resolve()
+        return any(root == resolved or root in resolved.parents for root in (self.workspace.uts_dir.resolve(), self.workspace.archives_dir.resolve()))
+
+    def count(self, size: int) -> None:
+        self.total_files += 1
+        self.total_bytes += size
+
+    # -- project copies -----------------------------------------------------
+
+    def scan_copy_dir(self, root: Path) -> EvoCopy:
+        rel_root = self.rel(root)
+        tree: dict[str, str] = {}
+        sizes: dict[str, int] = {}
+        skipped_files = 0
+        skipped_bytes = 0
+        last_mtime: float | None = None
+        for current, dirs, files in os.walk(root):
+            current_path = Path(current)
+            base = current_path.relative_to(root).as_posix()
+            dirs[:] = sorted(
+                name for name in dirs
+                if name != ".git" and name not in EVO_JUNK_DIR_NAMES and not (current_path / name).is_symlink()
+            )
+            for filename in sorted(files):
+                file_path = current_path / filename
+                rel_path = filename if base == "." else f"{base}/{filename}"
+                try:
+                    if file_path.is_symlink():
+                        continue
+                    stat = file_path.stat()
+                except OSError:
+                    continue
+                self.count(stat.st_size)
+                if self.is_filtered(rel_path):
+                    skipped_files += 1
+                    skipped_bytes += stat.st_size
+                    continue
+                try:
+                    key = evo_file_key(file_path, stat.st_size, self.git_ids)
+                except OSError as exc:
+                    self.warnings.append(f"не удалось прочитать {self.rel(file_path)}: {exc}")
+                    continue
+                tree[rel_path] = key
+                sizes[rel_path] = stat.st_size
+                self.blobs.add_disk(key, file_path, stat.st_size)
+                last_mtime = stat.st_mtime if last_mtime is None else max(last_mtime, stat.st_mtime)
+        # Без метки в имени момент копии оценивается по самому свежему файлу: раньше него
+        # это состояние существовать не могло.
+        named = evo_time_from_name(rel_root)
+        when = named or last_mtime or root.stat().st_mtime
+        return EvoCopy(
+            rel=rel_root, origin="dir", tree=tree, sizes=sizes, time=when, time_source="имя" if named else "mtime",
+            infra=self.under_infra(root), skipped_files=skipped_files, skipped_bytes=skipped_bytes, tree_id=evo_tree_id(tree),
+            last_mtime=last_mtime, devctl_made=self.is_uts_copy(root),
+        )
+
+    def scan_copy_zip(self, path: Path, archive: zipfile.ZipFile, members: list[zipfile.ZipInfo], prefix: str) -> EvoCopy:
+        tree: dict[str, str] = {}
+        sizes: dict[str, int] = {}
+        skipped_files = 0
+        skipped_bytes = 0
+        for info in members:
+            rel_path = info.filename[len(prefix):]
+            if not rel_path:
+                continue
+            if self.is_filtered(rel_path):
+                skipped_files += 1
+                skipped_bytes += info.file_size
+                continue
+            # Снимки одного проекта почти целиком повторяют друг друга: CRC32 и размер уже лежат
+            # в оглавлении zip, поэтому повторно встреченный файл не распаковывается вовсе.
+            fingerprint = (info.CRC, info.file_size)
+            key = self.zip_keys.get(fingerprint)
+            if key is None:
+                if info.file_size > EVO_FULL_HASH_LIMIT:
+                    key = evo_large_key(info.file_size)
+                else:
+                    try:
+                        key = evo_content_key(archive.read(info), self.git_ids)
+                    except (OSError, RuntimeError, zipfile.BadZipFile, zlib.error) as exc:
+                        self.warnings.append(f"не удалось прочитать {self.rel(path)}:{info.filename}: {exc}")
+                        continue
+                self.zip_keys[fingerprint] = key
+            tree[rel_path] = key
+            sizes[rel_path] = info.file_size
+            self.blobs.add_zip(key, path, info.filename, info.file_size)
+        named = evo_time_from_name(self.rel(path))
+        return EvoCopy(
+            rel=self.rel(path), origin="zip", tree=tree, sizes=sizes, time=named or path.stat().st_mtime,
+            time_source="имя" if named else "mtime", infra=self.under_infra(path),
+            skipped_files=skipped_files, skipped_bytes=skipped_bytes, tree_id=evo_tree_id(tree),
+            devctl_made=bool(EVO_SNAPSHOT_NAME_RE.match(path.name)),
+        )
+
+    # -- zip files ----------------------------------------------------------
+
+    def scan_zip(self, path: Path, size: int, mtime: float, *, snapshot: bool = False) -> None:
+        """snapshot=True — файл назван как снимок devctl: это копия проекта при любом составе."""
+        rel_path = self.rel(path)
+        try:
+            archive = zipfile.ZipFile(path, "r")
+        except (zipfile.BadZipFile, OSError) as exc:
+            self.loose_files.append(EvoLoose(rel_path, "zip", size, mtime, path=path, detail=[f"zip не читается: {exc}"]))
+            return
+        with archive:
+            members = [info for info in archive.infolist() if not info.is_dir()]
+            names = {info.filename for info in members}
+            if "manifest.json" in names and self.scan_patch(path, archive, members, size, mtime):
+                return
+            if {"index.json", "TIMELINE.md", "README.md"} <= names and self.is_own_archive(archive, path):
+                self.own_archives += 1
+                return
+            tops = {info.filename.split("/", 1)[0] for info in members}
+            prefix = ""
+            inner = tops
+            if len(tops) == 1 and all("/" in info.filename for info in members):
+                prefix = next(iter(tops)) + "/"
+                inner = {info.filename[len(prefix):].split("/", 1)[0] for info in members}
+            unpacked = sum(info.file_size for info in members)
+            if members and (snapshot or self.matches_signature(inner)) and unpacked <= EVO_SNAPSHOT_ZIP_LIMIT:
+                try:
+                    self.copies.append(self.scan_copy_zip(path, archive, members, prefix))
+                    return
+                except (zipfile.BadZipFile, OSError, RuntimeError, NotImplementedError) as exc:
+                    self.warnings.append(f"снимок {rel_path} не прочитан: {exc}")
+            shown = sorted(inner)[:10]
+            detail = f"zip: файлов {len(members)}, распаковано {human_size(unpacked)}"
+            if prefix:
+                detail += f"; корень {prefix}"
+            detail += f"; верхний уровень: {', '.join(shown)}{' …' if len(inner) > len(shown) else ''}"
+            self.loose_files.append(EvoLoose(rel_path, "zip", size, mtime, files=1, path=path, detail=[detail]))
+
+    def is_own_archive(self, archive: zipfile.ZipFile, path: Path) -> bool:
+        """Прежний эволюционный архив узнаётся по содержимому: файл могли и переименовать."""
+        if EVO_ARCHIVE_INFIX in path.name:
+            return True
+        try:
+            info = archive.getinfo("index.json")
+            if info.file_size > 64 * 1024 * 1024:
+                return False
+            return '"devctlEvolution"' in safe_decode(archive.read(info)[:4096])
+        except (KeyError, OSError, RuntimeError, zipfile.BadZipFile, zlib.error):
+            return False
+
+    def scan_patch(self, path: Path, archive: zipfile.ZipFile, members: list[zipfile.ZipInfo], size: int, mtime: float) -> bool:
+        manifest: dict[str, Any] | None = None
+        error: str | None = None
+        try:
+            loaded = json.loads(safe_decode(archive.read("manifest.json")))
+            if isinstance(loaded, dict):
+                manifest = loaded
+            else:
+                error = "корень manifest.json должен быть объектом"
+        except Exception as exc:  # повреждённый манифест тоже часть истории
+            error = f"manifest.json не читается: {exc}"
+        files_root = "files"
+        if manifest is not None:
+            apply_cfg = manifest.get("apply") if isinstance(manifest.get("apply"), dict) else {}
+            files_root = str(apply_cfg.get("filesRoot") or "files").strip("/") or "files"
+            looks_like_patch = "patchId" in manifest or "apply" in manifest or manifest.get("formatVersion") == 1
+        else:
+            looks_like_patch = any(info.filename.startswith("files/") for info in members)
+        if not looks_like_patch:
+            return False
+        prefix = files_root + "/"
+        when, source = mtime, "mtime"
+        created = manifest.get("createdAt") if manifest else None
+        if isinstance(created, str) and parse_iso_datetime(created):
+            when, source = float(parse_iso_datetime(created) or mtime), "manifest.createdAt"
+        elif evo_time_from_name(path.name):
+            when, source = float(evo_time_from_name(path.name) or mtime), "имя"
+        patch = EvoPatch(
+            rel=self.rel(path), name=path.name, sha256=sha256_file(path), time=when, time_source=source,
+            manifest=manifest, manifest_error=error,
+        )
+        for info in members:
+            if info.filename in {"PATCH_SUMMARY.md", prefix + "PATCH_SUMMARY.md"} and not patch.summary_md:
+                patch.summary_md = evo_decode(archive.read(info)[:EVO_NOTE_SIZE_LIMIT]).strip()
+            if not info.filename.startswith(prefix):
+                continue
+            rel_path = info.filename[len(prefix):]
+            if not rel_path or is_python_bytecode_artifact(rel_path):
+                continue
+            fingerprint = (info.CRC, info.file_size)
+            key = self.zip_keys.get(fingerprint)
+            if key is None:
+                key = (
+                    evo_large_key(info.file_size) if info.file_size > EVO_FULL_HASH_LIMIT
+                    else evo_content_key(archive.read(info), self.git_ids)
+                )
+                self.zip_keys[fingerprint] = key
+            patch.overlay[rel_path] = key
+            self.blobs.add_zip(key, path, info.filename, info.file_size)
+        if manifest is not None:
+            apply_cfg = manifest.get("apply") if isinstance(manifest.get("apply"), dict) else {}
+            deletes = apply_cfg.get("delete") if isinstance(apply_cfg.get("delete"), list) else []
+            patch.deletes = [str(item.get("path")) for item in deletes if isinstance(item, dict) and item.get("path")]
+        self.patches.append(patch)
+        return True
+
+    # -- run directories ----------------------------------------------------
+
+    def looks_like_run_dir(self, path: Path) -> bool:
+        if path.parent.resolve() != self.workspace.archives_dir.resolve():
+            return False
+        return (path / "report.md").is_file() or (path / "logs").is_dir() or (path / "sync-report.json").is_file()
+
+    def scan_run_dir(self, path: Path) -> None:
+        rel_dir = self.rel(path)
+        run = EvoRun(rel=rel_dir, time=evo_time_from_name(path.name) or path.stat().st_mtime, status="unknown")
+        match = EVO_RUN_DIR_RE.match(path.name)
+        if match and match.group(3) != "unknown":
+            run.patch_sha256 = match.group(3)
+        manifest_path = path / "logs" / "manifest.json"
+        if manifest_path.is_file():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8", errors="replace"))
+                run.patch_id = str(manifest.get("patchId") or "") or None
+                run.title = str(manifest.get("title") or "") or None
+            except (OSError, ValueError, AttributeError):
+                pass
+        sync_path = path / "sync-report.json"
+        if sync_path.is_file():
+            run.kind, run.status = "sync", "sync"
+            try:
+                report = json.loads(sync_path.read_text(encoding="utf-8", errors="replace"))
+                git_part = report.get("git") if isinstance(report.get("git"), dict) else {}
+                run.commit = str(git_part.get("headAfter") or "") or None
+            except (OSError, ValueError, AttributeError):
+                pass
+        report_path = path / "report.md"
+        if report_path.is_file():
+            self.parse_report(run, report_path.read_text(encoding="utf-8", errors="replace"))
+        for current, _dirs, files in os.walk(path):
+            for filename in files:
+                file_path = Path(current) / filename
+                try:
+                    stat = file_path.stat()
+                except OSError:
+                    continue
+                if filename.lower().endswith(".zip"):
+                    self.count(stat.st_size)
+                    if filename.startswith(("pre_", "post_", "failed_")) and stat.st_size <= 22:
+                        continue  # снимок пустого проекта перед самым первым патчем
+                    self.scan_zip(file_path, stat.st_size, stat.st_mtime, snapshot=bool(EVO_SNAPSHOT_NAME_RE.match(filename)))
+                    continue
+                self.count(stat.st_size)
+                relative = file_path.relative_to(path).as_posix()
+                known = relative in {"report.md", "sync-report.json"} or relative.startswith("logs/")
+                if not known:
+                    self.add_loose_file(file_path, stat.st_size, stat.st_mtime)
+        self.runs.append(run)
+
+    def parse_report(self, run: EvoRun, text: str) -> None:
+        head = re.search(r"^# Отчёт запуска devctl — (\S+)", text, re.MULTILINE)
+        if head:
+            run.status = head.group(1)
+
+        def field_value(label: str) -> str | None:
+            found = re.search(rf"^- {re.escape(label)}: `?([^`\n]+)`?\s*$", text, re.MULTILINE)
+            value = found.group(1).strip() if found else None
+            return None if value in {None, "нет", "неизвестно"} else value
+
+        run.patch_id = field_value("ID патча") or run.patch_id
+        run.title = field_value("Название") or run.title
+        run.patch_file = field_value("Файл патча")
+        sha256 = field_value("SHA-256 патча")
+        if sha256:
+            run.patch_sha256 = sha256
+        run.commit = field_value("SHA коммита") or run.commit
+        started = field_value("Старт")
+        if started and parse_iso_datetime(started):
+            run.time = float(parse_iso_datetime(started) or run.time)
+        section = text.split("## Проверки", 1)[1].split("\n## ", 1)[0] if "## Проверки" in text else ""
+        for line in section.splitlines():
+            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            if len(cells) < 4 or cells[0] in {"Проверка", ""} or set(cells[0]) <= {"-", ":"}:
+                continue
+            run.checks.append((cells[0], cells[1], cells[2]))
+            if cells[1] != "успех" and not run.fail_tail:
+                log_path = self.workspace.workspace_root / cells[3].strip("`")
+                try:
+                    lines = [line for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
+                    run.fail_tail = [evo_clip(line) for line in lines[-24:]]
+                except OSError:
+                    pass
+        errors = text.split("## Ошибки", 1)[1].split("\n## ", 1)[0] if "## Ошибки" in text else ""
+        run.errors = [evo_one_line(line[2:], 400) for line in errors.splitlines() if line.startswith("- ")]
+
+    def merge_state_runs(self) -> None:
+        try:
+            state = load_state(self.workspace)
+        except DevctlError as exc:
+            self.warnings.append(str(exc))
+            return
+        by_dir = {run.rel: run for run in self.runs}
+        for record in state.get("runs", []):
+            if not isinstance(record, dict):
+                continue
+            archive_dir = str(record.get("archiveDir") or "")
+            run = by_dir.get(archive_dir)
+            if run is None:
+                started = parse_iso_datetime(str(record.get("startedAt") or ""))
+                run = EvoRun(
+                    rel=archive_dir or f"state.json:{record.get('patchId')}", time=float(started or 0.0),
+                    status=str(record.get("status") or "unknown"), archived=False,
+                )
+                self.runs.append(run)
+            run.patch_id = run.patch_id or (str(record.get("patchId")) if record.get("patchId") else None)
+            run.patch_file = run.patch_file or (str(record.get("patchFile")) if record.get("patchFile") else None)
+            if record.get("patchSha256"):
+                run.patch_sha256 = str(record.get("patchSha256"))
+            run.commit = run.commit or (str(record.get("commitSha")) if record.get("commitSha") else None)
+            if run.status == "unknown" and record.get("status"):
+                run.status = str(record.get("status"))
+
+    # -- everything else ----------------------------------------------------
+
+    def add_loose_file(self, path: Path, size: int, mtime: float) -> None:
+        is_text = False
+        if size <= EVO_NOTE_SIZE_LIMIT:
+            try:
+                with path.open("rb") as handle:
+                    is_text = evo_is_text_bytes(handle.read(EVO_SNIFF_BYTES))
+            except OSError:
+                is_text = False
+        self.loose_files.append(EvoLoose(self.rel(path), "file", size, mtime, is_text=is_text, path=path))
+
+    def walk(self, directory: Path) -> None:
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError as exc:
+            self.warnings.append(f"каталог не читается: {self.rel(directory)}: {exc}")
+            return
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir():
+                    resolved = path.resolve()
+                    if entry.name == ".git" or resolved == self.workspace.state_dir.resolve():
+                        continue
+                    if entry.name in EVO_JUNK_DIR_NAMES:
+                        for current, _dirs, files in os.walk(path):
+                            for filename in files:
+                                try:
+                                    self.junk_bytes += (Path(current) / filename).stat().st_size
+                                    self.junk_files += 1
+                                except OSError:
+                                    pass
+                        continue
+                    if resolved == self.workspace.project_root.resolve() and not self.same_root:
+                        continue
+                    if self.looks_like_run_dir(path):
+                        self.scan_run_dir(path)
+                        continue
+                    if self.same_root and self.rel(path) in self.project_dirs:
+                        # Каталог самого проекта: в нём ищем только посторонние файлы.
+                        self.walk(path)
+                        continue
+                    if self.is_uts_copy(path):
+                        # Копию, которую сделал сам devctl, узнаём по имени: ранний проект
+                        # может состоять из пары файлов и не походить на нынешний.
+                        self.copies.append(self.scan_copy_dir(path))
+                        continue
+                    if resolved not in self.infra_roots:
+                        try:
+                            names = [item.name for item in os.scandir(path)]
+                        except OSError:
+                            names = []
+                        if self.matches_signature(names):
+                            self.copies.append(self.scan_copy_dir(path))
+                            continue
+                    self.walk(path)
+                    continue
+                stat = entry.stat()
+            except OSError as exc:
+                self.warnings.append(f"не удалось прочитать {self.rel(path)}: {exc}")
+                continue
+            rel_path = self.rel(path)
+            if self.same_root and rel_path in self.project_files:
+                continue
+            self.count(stat.st_size)
+            if entry.name.lower().endswith(".zip"):
+                self.scan_zip(path, stat.st_size, stat.st_mtime)
+            else:
+                self.add_loose_file(path, stat.st_size, stat.st_mtime)
+
+
+def evo_fold_loose(files: list[EvoLoose]) -> list[EvoLoose]:
+    """Мелкие каталоги остаются пофайлово, тяжёлые сворачиваются в одну запись."""
+
+    class Node:
+        def __init__(self) -> None:
+            self.files: list[EvoLoose] = []
+            self.dirs: dict[str, "Node"] = {}
+
+        def all_files(self) -> list[EvoLoose]:
+            result = list(self.files)
+            for child in self.dirs.values():
+                result.extend(child.all_files())
+            return result
+
+    root = Node()
+    for item in files:
+        node = root
+        for part in item.rel.split("/")[:-1]:
+            node = node.dirs.setdefault(part, Node())
+        node.files.append(item)
+
+    result: list[EvoLoose] = []
+
+    def fold(node: Node, rel: str) -> EvoLoose:
+        inside = node.all_files()
+        extensions: dict[str, int] = {}
+        for item in inside:
+            suffix = Path(item.rel).suffix.lower() or "без расширения"
+            extensions[suffix] = extensions.get(suffix, 0) + 1
+        top = sorted(extensions.items(), key=lambda pair: (-pair[1], pair[0]))[:8]
+        children = [f"{name}/ ({len(child.all_files())})" for name, child in sorted(node.dirs.items())]
+        children += [Path(item.rel).name for item in sorted(node.files, key=lambda item: item.rel)]
+        detail = [
+            "типы: " + ", ".join(f"{suffix}×{count}" for suffix, count in top),
+            "состав: " + ", ".join(children[:24]) + (f" … ещё {len(children) - 24}" if len(children) > 24 else ""),
+        ]
+        times = [item.time for item in inside]
+        return EvoLoose(
+            rel=rel + "/", kind="dir", size=sum(item.size for item in inside), time=min(times),
+            time_end=max(times), files=len(inside), detail=detail,
+        )
+
+    def emit(node: Node, rel: str, depth: int) -> None:
+        total = len(node.all_files())
+        if depth > 0 and total > EVO_BIG_DIR_FILES:
+            result.append(fold(node, rel))
+            return
+        if depth > 0 and total <= EVO_SMALL_DIR_FILES:
+            result.extend(node.all_files())
+            return
+        result.extend(node.files)
+        for name, child in sorted(node.dirs.items()):
+            child_rel = f"{rel}/{name}" if rel else name
+            if depth > 0 and len(child.all_files()) > EVO_SMALL_DIR_FILES:
+                result.append(fold(child, child_rel))
+            else:
+                emit(child, child_rel, depth + 1)
+
+    emit(root, "", 0)
+    return result
+
+
+def evo_diff_trees(old: dict[str, str], new: dict[str, str]) -> list[EvoChange]:
+    changes: list[EvoChange] = []
+    for path in sorted(old.keys() | new.keys()):
+        before, after = old.get(path), new.get(path)
+        if before == after:
+            continue
+        status = "A" if before is None else "D" if after is None else "M"
+        changes.append(EvoChange(status, path, before, after))
+    return changes
+
+
+def evo_detect_renames(changes: list[EvoChange]) -> list[EvoChange]:
+    """Точные переименования: удалённый и добавленный файл с одинаковым содержимым."""
+    removed: dict[str, list[EvoChange]] = {}
+    for change in changes:
+        if change.status == "D" and change.old_key:
+            removed.setdefault(change.old_key, []).append(change)
+    consumed: set[int] = set()
+    result: list[EvoChange] = []
+    for change in changes:
+        if change.status == "A" and change.new_key and removed.get(change.new_key):
+            source = removed[change.new_key].pop(0)
+            consumed.add(id(source))
+            result.append(EvoChange("R", change.path, source.old_key, change.new_key, old_path=source.path))
+        else:
+            result.append(change)
+    return [change for change in result if id(change) not in consumed]
+
+
+def evo_apply_changes(tree: dict[str, str], changes: list[EvoChange]) -> None:
+    for change in changes:
+        if change.status == "R" and change.old_path:
+            tree.pop(change.old_path, None)
+        if change.status == "D":
+            tree.pop(change.path, None)
+        elif change.new_key is not None:
+            tree[change.path] = change.new_key
+
+
+def evo_worktree_step(workspace: Workspace, scan: EvoScan, head_tree: dict[str, str], has_git: bool) -> EvoStep | None:
+    """Незакоммиченное состояние проекта; без Git — единственное известное состояние."""
+    root = workspace.project_root
+    if not root.is_dir():
+        return None
+    tree = dict(head_tree)
+    newest = 0.0
+    if has_git:
+        status = git(root, ["-c", "core.quotepath=off", "status", "--porcelain", "-z", "--untracked-files=all"], timeout=600)
+        if status.returncode != 0:
+            return None
+        tokens = [token for token in status.stdout.split("\x00") if token]
+        position = 0
+        touched: list[str] = []
+        while position < len(tokens):
+            token = tokens[position]
+            position += 1
+            code, path = token[:2], token[3:]
+            if code[0] in {"R", "C"} and position < len(tokens):
+                touched.append(tokens[position])
+                position += 1
+            touched.append(path)
+        for path in touched:
+            file_path = root / Path(*path.split("/"))
+            if file_path.is_file() and not file_path.is_symlink():
+                stat = file_path.stat()
+                key = evo_file_key(file_path, stat.st_size, scan.git_ids)
+                scan.blobs.add_disk(key, file_path, stat.st_size)
+                tree[path] = key
+                newest = max(newest, stat.st_mtime)
+            elif not file_path.exists():
+                tree.pop(path, None)
+    else:
+        tree = {}
+        for file_path in evo_plain_project_files(workspace, scan):
+            rel_path = file_path.relative_to(root).as_posix()
+            try:
+                stat = file_path.stat()
+                key = evo_file_key(file_path, stat.st_size, scan.git_ids)
+            except OSError:
+                continue
+            scan.blobs.add_disk(key, file_path, stat.st_size)
+            tree[rel_path] = key
+            scan.count(stat.st_size)
+            newest = max(newest, stat.st_mtime)
+    changes = evo_diff_trees(head_tree, tree)
+    if not changes:
+        return None
+    label = "незакоммиченные изменения рабочего дерева" if has_git else "текущее состояние проекта (без Git)"
+    return EvoStep(index=0, kind="worktree", time=newest or time.time(), time_source="mtime", label=label, changes=changes, tree=tree)
+
+
+def evo_build_chain(git_steps: list[EvoStep], copies: list[EvoCopy], scan: EvoScan) -> tuple[list[EvoStep], list[EvoCopy]]:
+    """Цепочка уникальных состояний: история до Git из снимков, затем коммиты.
+
+    Возвращает цепочку и копии, которые не стали её звеньями.
+    """
+    filtered_ids: set[int] = set()
+    running: dict[str, str] = {}
+    for step in git_steps:
+        evo_apply_changes(running, step.changes)
+        step.filtered_id = evo_tree_id({path: key for path, key in running.items() if not scan.is_filtered(path)})
+        filtered_ids.add(step.filtered_id)
+    first_git = git_steps[0].time if git_steps else None
+    early: list[EvoCopy] = []
+    rest: list[EvoCopy] = []
+    for copy in sorted(copies, key=lambda item: (item.time, item.rel)):
+        # failed-архив — тупиковая ветка: изменения патча, который был откатан.
+        dead_end = copy.rel.rsplit("/", 1)[-1].startswith("failed_")
+        is_new_state = copy.tree_id not in filtered_ids and bool(copy.tree) and not dead_end
+        if is_new_state and (first_git is None or copy.time < first_git):
+            early.append(copy)
+        else:
+            rest.append(copy)
+    # Звеном цепочки без Git может стать только копия, чистая по построению:
+    #  - архив-снимок (его никто не правит);
+    #  - копия UserTestSpace, созданная devctl, если от того же состояния не осталось архива
+    #    и в ней нет файлов моложе её собственной метки (иначе в ней работали руками).
+    # Остальные каталоги — копии с локальными правками. Если чистых кандидатов нет вовсе,
+    # цепочка строится по всем каталогам: другой истории у workspace не осталось.
+    zip_tags = {copy.state_tag for copy in early if copy.origin == "zip" and copy.state_tag}
+    made = [copy for copy in early if copy.origin == "dir" and copy.devctl_made]
+    touched = {
+        id(copy) for copy in made
+        if copy.time_source == "имя" and copy.last_mtime is not None and copy.last_mtime > copy.time + EVO_UTS_MTIME_SLACK
+    }
+    if len(touched) * 2 > len(made):
+        touched = set()  # mtime сброшен переносом на другую машину: признак ничего не значит
+    trusted = [
+        copy for copy in early
+        if copy.origin == "zip" or (copy.devctl_made and id(copy) not in touched and copy.state_tag not in zip_tags)
+    ]
+    if trusted:
+        keep = {id(copy) for copy in trusted}
+        rest.extend(copy for copy in early if id(copy) not in keep)
+        early = trusted
+    chain: list[EvoStep] = []
+    previous: dict[str, str] = {}
+    seen: set[int] = set()
+    for copy in early:
+        if copy.tree_id in seen:
+            rest.append(copy)
+            continue
+        seen.add(copy.tree_id)
+        step = EvoStep(
+            index=len(chain), kind="snapshot", time=copy.time, time_source=copy.time_source,
+            label=f"снимок {copy.rel}", changes=evo_diff_trees(previous, copy.tree), tree=dict(copy.tree),
+            filtered_id=copy.tree_id,
+        )
+        step.witnesses.append(f"{copy.rel} ({'архив' if copy.origin == 'zip' else 'каталог'})")
+        previous = copy.tree
+        chain.append(step)
+    if chain and git_steps:
+        # Первый коммит описывается относительно последнего снимка, а не пустоты.
+        root_tree: dict[str, str] = {}
+        evo_apply_changes(root_tree, git_steps[0].changes)
+        git_steps[0].changes = evo_diff_trees(previous, root_tree)
+    chain.extend(git_steps)
+    for index, step in enumerate(chain):
+        step.index = index
+        step.changes = evo_detect_renames(step.changes)
+    return chain, sorted(rest, key=lambda item: (item.time, item.rel))
+
+
+def evo_link_copies(chain: list[EvoStep], copies: list[EvoCopy], scan: EvoScan) -> list[EvoCopy]:
+    """Каждая копия — либо точный свидетель состояния, либо состояние плюс локальные правки.
+
+    Возвращает копии, оказавшиеся посторонними деревьями.
+    """
+    if not chain:
+        return copies
+    by_id: dict[int, int] = {}
+    for step in chain:
+        by_id.setdefault(step.filtered_id, step.index)
+    pending = [copy for copy in copies if copy.tree_id not in by_id]
+    for copy in copies:
+        if copy.tree_id in by_id:
+            copy.step, copy.exact, copy.overlap = by_id[copy.tree_id], True, 1.0
+    # Ближайшее состояние ищется одним проходом по цепочке: счётчик совпавших
+    # пар «путь + содержимое» обновляется только на изменившихся путях.
+    best: dict[int, tuple[int, int, int]] = {id(copy): (-(1 << 60), -1, 0) for copy in pending}
+    current: dict[int, int] = {id(copy): 0 for copy in pending}
+    state_size = 0
+    interested: dict[str, list[EvoCopy]] = {}
+    for copy in pending:
+        for path in copy.tree:
+            interested.setdefault(path, []).append(copy)
+    running: dict[str, str] = {}
+    needed: dict[int, dict[str, str]] = {}
+    for step in chain:
+        for change in step.changes:
+            paths = [(change.path, None if change.status == "D" else change.new_key)]
+            if change.status == "R" and change.old_path:
+                paths.append((change.old_path, None))
+            for path, new_key in paths:
+                old_key = running.get(path)
+                for copy in interested.get(path, ()):
+                    mine = copy.tree[path]
+                    current[id(copy)] += int(new_key == mine) - int(old_key == mine)
+                if not scan.is_filtered(path):
+                    state_size += int(new_key is not None) - int(old_key is not None)
+                if new_key is None:
+                    running.pop(path, None)
+                else:
+                    running[path] = new_key
+        for copy in pending:
+            # Ближайшее состояние — с наименьшим числом отличающихся путей в обе стороны.
+            # Короткий sha в имени копии (так их называет devctl) решает спорные случаи.
+            matched = current[id(copy)]
+            score = 2 * matched - state_size
+            named = bool(step.commit) and short_sha(step.commit) in copy.rel
+            if matched > 0 and (score > best[id(copy)][0] or (named and matched * 5 >= len(copy.tree))):
+                best[id(copy)] = ((1 << 59) if named else score, step.index, matched)
+    for copy in pending:
+        _score, index, matched = best[id(copy)]
+        copy.overlap = matched / max(len(copy.tree), 1)
+        copy.step = index if index >= 0 and copy.overlap >= 0.2 else None
+        if copy.step is not None:
+            needed.setdefault(copy.step, {})
+    foreign = [copy for copy in pending if copy.step is None]
+    if needed:
+        running = {}
+        for step in chain:
+            evo_apply_changes(running, step.changes)
+            if step.index in needed:
+                needed[step.index] = {path: key for path, key in running.items() if not scan.is_filtered(path)}
+        for copy in pending:
+            if copy.step is not None:
+                copy.changes = evo_detect_renames(evo_diff_trees(needed[copy.step], copy.tree))
+    for copy in copies:
+        if copy.step is not None:
+            chain[copy.step].copies.append(copy)
+    return foreign
+
+
+def evo_link_patches(chain: list[EvoStep], patches: list[EvoPatch], runs: list[EvoRun]) -> None:
+    by_commit: dict[str, int] = {step.commit: step.index for step in chain if step.commit}
+
+    def step_for_commit(sha: str | None) -> int | None:
+        if not sha:
+            return None
+        if sha in by_commit:
+            return by_commit[sha]
+        matches = [index for commit, index in by_commit.items() if commit.startswith(sha)] if len(sha) >= 7 else []
+        return matches[0] if len(matches) == 1 else None
+
+    by_sha = {patch.sha256: patch for patch in patches}
+    by_id: dict[str, list[EvoPatch]] = {}
+    for patch in patches:
+        by_id.setdefault(patch.patch_id, []).append(patch)
+
+    # 1. Трейлеры коммитов, которые devctl пишет сам.
+    for step in chain:
+        trailers = dict(EVO_TRAILER_RE.findall(step.body or ""))
+        patch = by_sha.get(trailers.get("Patch-SHA256", ""))
+        if patch is None and trailers.get("Patch-Id") and len(by_id.get(trailers["Patch-Id"], [])) == 1:
+            patch = by_id[trailers["Patch-Id"]][0]
+        if patch is not None and patch.step is None:
+            patch.step, patch.link = step.index, "трейлер коммита"
+    # 2. Журнал запусков: успешный запуск знает и патч, и коммит.
+    for run in runs:
+        run.step = step_for_commit(run.commit)
+        patch = None
+        if run.patch_sha256:
+            patch = by_sha.get(run.patch_sha256) or next((item for item in patches if item.sha256.startswith(run.patch_sha256 or "-")), None)
+        if patch is None and run.patch_id and len(by_id.get(run.patch_id, [])) == 1:
+            patch = by_id[run.patch_id][0]
+        if patch is not None and run.step is not None and run.status in {"applied", "push_failed"} and patch.step is None:
+            patch.step, patch.link = run.step, "журнал запусков"
+        if run.step is None and patch is not None and patch.step is not None and run.status == "applied":
+            run.step = patch.step
+    # 3. Совпадение по содержимому: первый шаг, после которого все файлы патча на месте.
+    open_patches = [patch for patch in patches if patch.step is None and patch.overlay]
+    if open_patches:
+        watchers: dict[str, list[EvoPatch]] = {}
+        present: dict[int, int] = {id(patch): 0 for patch in open_patches}
+        for patch in open_patches:
+            for path in patch.overlay:
+                watchers.setdefault(path, []).append(patch)
+        running: dict[str, str] = {}
+        for step in chain:
+            touched: set[int] = set()
+            for change in step.changes:
+                pairs = [(change.path, None if change.status == "D" else change.new_key)]
+                if change.status == "R" and change.old_path:
+                    pairs.append((change.old_path, None))
+                for path, new_key in pairs:
+                    old_key = running.get(path)
+                    for patch in watchers.get(path, ()):
+                        present[id(patch)] += int(new_key == patch.overlay[path]) - int(old_key == patch.overlay[path])
+                        touched.add(id(patch))
+                    if new_key is None:
+                        running.pop(path, None)
+                    else:
+                        running[path] = new_key
+            for patch in open_patches:
+                if patch.step is None and id(patch) in touched and present[id(patch)] == len(patch.overlay):
+                    patch.step, patch.link = step.index, "совпадение содержимого"
+    for patch in patches:
+        if patch.step is not None:
+            chain[patch.step].patches.append(patch)
+    for run in runs:
+        if run.step is None and run.status == "applied":
+            # Коммита в истории нет (например, проект перенесён без .git): запуск находит шаг через свой патч.
+            owner = by_sha.get(run.patch_sha256 or "") or next(
+                (patch for patch in patches if run.patch_file and patch.name == run.patch_file), None
+            )
+            if owner is not None:
+                run.step = owner.step
+        if run.step is not None:
+            chain[run.step].runs.append(run)
+            continue
+        # Неудачный запуск и сохранившийся файл его патча — одно событие, а не два.
+        failed = by_sha.get(run.patch_sha256 or "") or next(
+            (patch for patch in patches if run.patch_sha256 and len(run.patch_sha256) >= 7 and patch.sha256.startswith(run.patch_sha256)), None
+        ) or next((patch for patch in patches if run.patch_file and patch.name == run.patch_file), None)
+        if failed is not None and failed.step is None:
+            run.patch = failed
+            failed.in_run = True
+
+
+def evo_item_weight(path: str, base: float = 1.0) -> float:
+    lower = path.lower()
+    suffix = Path(lower).suffix
+    name = lower.rsplit("/", 1)[-1]
+    if "/test" in "/" + lower or name.startswith("test_") or name.endswith(("_test.py", ".test.js", ".spec.ts")):
+        return base * 0.4
+    if suffix in EVO_CODE_SUFFIXES or name in {"makefile", "dockerfile"}:
+        return base * 1.0
+    if suffix in EVO_DOC_SUFFIXES:
+        return base * 0.5
+    return base * 0.3
+
+
+def evo_outline(lines: Iterable[str], path: str = "", limit: int = 40) -> list[str]:
+    """Объявления в коде или заголовки в документах: краткая карта содержимого."""
+    pattern = EVO_HEADING_RE if Path(path).suffix.lower() in EVO_DOC_SUFFIXES else EVO_DECL_RE
+    result: list[str] = []
+    for line in lines:
+        if pattern.match(line):
+            text = line.strip().rstrip("{:").strip()
+            text = text[:90]
+            if text and text not in result:
+                result.append(text)
+                if len(result) >= limit:
+                    break
+    return result
+
+
+def evo_fold_hash_churn(lines: list[str]) -> list[str]:
+    """Блоки, где старая и новая строки отличаются только хэшами, сворачиваются в одну строку."""
+    result: list[str] = []
+    position = 0
+    while position < len(lines):
+        if not lines[position].startswith("-"):
+            result.append(lines[position])
+            position += 1
+            continue
+        start = position
+        while position < len(lines) and lines[position].startswith("-"):
+            position += 1
+        minus = lines[start:position]
+        plus_start = position
+        while position < len(lines) and lines[position].startswith("+"):
+            position += 1
+        plus = lines[plus_start:position]
+        if len(minus) == len(plus) and minus and all(
+            EVO_HEX_RUN_RE.search(old) and EVO_HEX_RUN_RE.sub("#", old[1:]) == EVO_HEX_RUN_RE.sub("#", new[1:])
+            for old, new in zip(minus, plus)
+        ):
+            sample = evo_clip(EVO_HEX_RUN_RE.sub("#", plus[0][1:]).strip(), 100)
+            result.append(f"~ строк с изменившимися только хэшами: {len(minus)} (образец: {sample})")
+        else:
+            result.extend(minus)
+            result.extend(plus)
+    return result
+
+
+def evo_text_lines(data: bytes | None) -> list[str] | None:
+    if data is None or not evo_is_text_bytes(data):
+        return None
+    lines = evo_decode(data).replace("\r\n", "\n").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()  # завершающий перевод строки не считается отдельной пустой строкой
+    return lines
+
+
+def evo_change_item(change: EvoChange, blobs: EvoBlobStore, weight: float) -> tuple[str, EvoItem | None]:
+    """Однострочная статистика изменения и, если есть что показать, тело с бюджетом."""
+    path = change.path
+    if change.status == "R":
+        return f"R {change.old_path} → {path}", None
+    if change.status == "D":
+        return f"D {path}", None
+    new_key = change.new_key or ""
+    if new_key.startswith("gitlink:"):
+        return f"{change.status} {path} (подмодуль {new_key[8:20]})", None
+    size = blobs.size(new_key)
+    new_data = blobs.read(new_key, EVO_DIFF_SIZE_LIMIT)
+    new_lines = evo_text_lines(new_data)
+    if new_data is None:
+        if new_key.startswith("L"):
+            return f"{change.status} {path} ({human_size(size)}; такие файлы сравниваются только по размеру)", None
+        reason = f"{human_size(size)}, содержимое не показано" if size is not None else "содержимое недоступно"
+        return f"{change.status} {path} ({reason}; ключ {new_key[:12]})", None
+    if new_lines is None:
+        return f"{change.status} {path} (бинарный, {human_size(len(new_data))}; ключ {new_key[:12]})", None
+    if change.status == "A":
+        lines = [evo_clip(line) for line in new_lines]
+        while lines and not lines[-1]:
+            lines.pop()
+        # У нового файла суть передаёт перечень объявлений, у изменённого — сам дифф: ему и отдаётся место.
+        item = EvoItem(title=path, lines=lines, weight=weight * EVO_ADDED_WEIGHT, outline=evo_outline(new_lines, path), fence="text")
+        return f"A {path} (+{len(lines)} строк)", item
+    old_lines = evo_text_lines(blobs.read(change.old_key, EVO_DIFF_SIZE_LIMIT))
+    if old_lines is None:
+        return f"M {path} (прежнее содержимое бинарное или недоступно; новых строк {len(new_lines)})", None
+    if [line.rstrip() for line in old_lines] == [line.rstrip() for line in new_lines]:
+        return f"M {path} (изменились только пробелы или окончания строк)", None
+    if len(old_lines) > 4000 and len(new_lines) > 4000 and difflib.SequenceMatcher(None, old_lines, new_lines).quick_ratio() < 0.3:
+        diff: list[str] = []
+    else:
+        diff = [
+            line for line in difflib.unified_diff(old_lines, new_lines, n=EVO_DIFF_CONTEXT, lineterm="")
+            if not line.startswith(("--- ", "+++ "))
+        ]
+    added = sum(1 for line in diff if line.startswith("+"))
+    removed = sum(1 for line in diff if line.startswith("-"))
+    stat = f"M {path} (+{added} −{removed})"
+    if not diff or len(diff) > max(len(new_lines) * 1.5, 40) and removed > len(old_lines) * 0.8:
+        lines = [evo_clip(line) for line in new_lines]
+        item = EvoItem(title=path, lines=lines, weight=weight * EVO_ADDED_WEIGHT, outline=evo_outline(new_lines, path), fence="text")
+        return f"M {path} (переписан: было строк {len(old_lines)}, стало {len(new_lines)})", item
+    pattern = EVO_HEADING_RE if Path(path).suffix.lower() in EVO_DOC_SUFFIXES else EVO_DECL_RE
+    touched: list[str] = []
+    for line in diff:
+        if line.startswith("@@"):
+            found = re.search(r"\+(\d+)", line)
+            start = int(found.group(1)) if found else 1
+            for candidate in range(min(start, len(new_lines)) - 1, -1, -1):
+                if pattern.match(new_lines[candidate]):
+                    touched.extend(evo_outline([new_lines[candidate]], path))
+                    break
+        elif line[:1] in "+-" and pattern.match(line[1:]):
+            touched.extend(evo_outline([line[1:]], path))
+    outline = list(dict.fromkeys(touched))
+    folded = evo_fold_hash_churn([evo_clip(line) for line in diff])
+    return stat, EvoItem(title=path, lines=folded, weight=weight, outline=outline, fence="diff")
+
+
+@dataclass
+class EvoEvent:
+    time: float
+    order: int
+    kind: str  # step | run | patch | copy | loose
+    ref: Any
+    seq: int = 0
+    members: list[Any] = field(default_factory=list)
+    file: str | None = None
+
+
+@dataclass
+class EvoModel:
+    workspace: Workspace
+    git_info: dict[str, Any]
+    chain: list[EvoStep]
+    patches: list[EvoPatch]
+    runs: list[EvoRun]
+    copies: list[EvoCopy]
+    loose: list[EvoLoose]
+    scan: EvoScan
+    blobs: EvoBlobStore
+    final_tree: dict[str, str]
+
+
+def evo_collect(workspace: Workspace, *, quiet: bool = False) -> EvoModel:
+    evo_progress("[1/5] История Git…", quiet=quiet)
+    git_steps, git_ids, git_info = evo_read_git_history(workspace.project_root)
+    signature: set[str] = set()
+    head_tree: dict[str, str] = {}
+    for step in git_steps:
+        evo_apply_changes(head_tree, step.changes)
+        signature.update(change.path.split("/", 1)[0] for change in step.changes)
+    has_git = bool(git_steps)
+    if not signature and workspace.project_root.is_dir():
+        infra = {workspace.patches_dir.resolve(), workspace.archives_dir.resolve(), workspace.uts_dir.resolve(), workspace.state_dir.resolve()}
+        signature = {
+            entry.name for entry in os.scandir(workspace.project_root)
+            if entry.name != ".git" and entry.name not in EVO_JUNK_DIR_NAMES and Path(entry.path).resolve() not in infra
+        }
+    blobs = EvoBlobStore(workspace.project_root, git_ids)
+    scan = EvoScan(workspace, git_ids, blobs, signature, quiet)
+    if has_git:
+        listed = git(workspace.project_root, ["-c", "core.quotepath=off", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], timeout=600)
+        if listed.returncode == 0:
+            scan.project_files = {scan.rel(workspace.project_root / Path(*item.split("/"))) for item in listed.stdout.split("\x00") if item}
+    elif scan.same_root:
+        scan.project_files = {scan.rel(path) for path in evo_plain_project_files(workspace, scan)}
+    for rel_path in scan.project_files:
+        parts = rel_path.split("/")[:-1]
+        scan.project_dirs.update("/".join(parts[:depth]) for depth in range(1, len(parts) + 1))
+    evo_progress("[2/5] Сканирование workspace: копии проекта, патчи, запуски, прочие материалы…", quiet=quiet)
+    scan.walk(workspace.workspace_root)
+    scan.merge_state_runs()
+    evo_progress(
+        f"      файлов: {scan.total_files}, объём: {human_size(scan.total_bytes)}; копий проекта: {len(scan.copies)}, "
+        f"патчей: {len(scan.patches)}, запусков: {len(scan.runs)}",
+        quiet=quiet,
+    )
+    evo_progress("[3/5] Цепочка состояний и связи…", quiet=quiet)
+    chain, copies = evo_build_chain(git_steps, scan.copies, scan)
+    final_tree: dict[str, str] = {}
+    for step in chain:
+        evo_apply_changes(final_tree, step.changes)
+    worktree = evo_worktree_step(workspace, scan, final_tree, has_git)
+    if worktree is not None:
+        worktree.index = len(chain)
+        worktree.changes = evo_detect_renames(worktree.changes)
+        worktree.filtered_id = evo_tree_id({path: key for path, key in (worktree.tree or {}).items() if not scan.is_filtered(path)})
+        chain.append(worktree)
+        final_tree = dict(worktree.tree or final_tree)
+    foreign = evo_link_copies(chain, copies, scan)
+    linked = [copy for copy in copies if copy.step is not None]
+    evo_link_patches(chain, scan.patches, scan.runs)
+    loose_files = list(scan.loose_files)
+    for copy in foreign:
+        # Структура похожа на проект, но содержимое чужое: это обычный каталог материалов.
+        for path, size in copy.sizes.items():
+            loose_files.append(EvoLoose(f"{copy.rel}/{path}", "file", size, copy.time))
+    loose = evo_fold_loose(loose_files)
+    return EvoModel(workspace, git_info, chain, scan.patches, scan.runs, linked, loose, scan, blobs, final_tree)
+
+
+def evo_plain_project_files(workspace: Workspace, scan: EvoScan) -> list[Path]:
+    infra = scan.infra_roots | {workspace.state_dir.resolve()}
+    result: list[Path] = []
+    for current, dirs, files in os.walk(workspace.project_root):
+        current_path = Path(current)
+        dirs[:] = sorted(
+            name for name in dirs
+            if name != ".git" and name not in EVO_JUNK_DIR_NAMES and (current_path / name).resolve() not in infra
+        )
+        for filename in sorted(files):
+            path = current_path / filename
+            rel_path = path.relative_to(workspace.project_root).as_posix()
+            if path.is_symlink() or scan.is_filtered(rel_path) or (EVO_ARCHIVE_INFIX in filename and filename.endswith(".zip")):
+                continue
+            result.append(path)
+    return result
+
+
+def evo_build_events(model: EvoModel) -> list[EvoEvent]:
+    events: list[EvoEvent] = []
+    floor = 0.0
+    step_time: dict[int, float] = {}
+    for step in model.chain:
+        # Порядок звеньев цепочки важнее показаний часов: время не убывает.
+        floor = max(floor + 0.001, step.time)
+        step_time[step.index] = floor
+        events.append(EvoEvent(floor, 0, "step", step))
+    for run in model.runs:
+        if run.step is None:
+            events.append(EvoEvent(run.time, 1, "run", run))
+    for patch in model.patches:
+        if patch.step is None and not patch.in_run:
+            events.append(EvoEvent(patch.time, 2, "patch", patch))
+    for copy in model.copies:
+        if not copy.infra:
+            # Копия не может появиться раньше состояния, которое она повторяет: файлы в ней
+            # сохраняют старые mtime, поэтому часы тут ненадёжны.
+            origin = step_time.get(copy.step if copy.step is not None else -1, 0.0)
+            events.append(EvoEvent(max(copy.time, origin + 0.0005), 3, "copy", copy))
+    for item in model.loose:
+        events.append(EvoEvent(item.time, 4, "loose", item))
+    events.sort(key=lambda event: (event.time, event.order))
+    merged: list[EvoEvent] = []
+    for event in events:
+        previous = merged[-1] if merged else None
+        mergeable = (
+            previous is not None and previous.kind == "loose" and event.kind == "loose"
+            and not evo_is_note(previous.ref) and not evo_is_note(event.ref)
+            and previous.ref.kind == "file" and event.ref.kind == "file"
+            and previous.ref.rel.rsplit("/", 1)[0] == event.ref.rel.rsplit("/", 1)[0] and "/" in event.ref.rel
+        )
+        if mergeable and previous is not None:
+            previous.members.append(event.ref)
+        else:
+            event.members = [event.ref]
+            merged.append(event)
+    for number, event in enumerate(merged, start=1):
+        event.seq = number
+    return merged
+
+
+def evo_is_note(item: EvoLoose) -> bool:
+    return item.kind == "file" and item.is_text and item.path is not None and (
+        Path(item.rel).suffix.lower() in EVO_NOTE_SUFFIXES or item.size <= 4096
+    )
+
+
+def evo_counts(changes: list[EvoChange]) -> str:
+    counts = {status: sum(1 for change in changes if change.status == status) for status in "AMDR"}
+    parts = [f"{label}{counts[status]}" for status, label in (("A", "+"), ("M", "~"), ("D", "−"), ("R", "→")) if counts[status]]
+    return f"файлов {len(changes)} ({' '.join(parts)})" if changes else "без изменений файлов"
+
+
+def evo_render_changes(
+    changes: list[EvoChange], blobs: EvoBlobStore, base_weight: float, recency: float, skip_body: frozenset[str] = frozenset(),
+) -> list[Any]:
+    """Список строк и EvoItem: статистика по каждому файлу и тела под бюджет."""
+    parts: list[Any] = []
+    added_by_dir: dict[str, list[EvoChange]] = {}
+    for change in changes:
+        if change.status == "A" and "/" in change.path:
+            added_by_dir.setdefault(change.path.split("/", 1)[0], []).append(change)
+    bulk = {name for name, group in added_by_dir.items() if len(group) >= EVO_BULK_ADD_THRESHOLD}
+    for name in sorted(bulk):
+        group = added_by_dir[name]
+        extensions: dict[str, int] = {}
+        total = 0
+        for change in group:
+            suffix = Path(change.path).suffix.lower() or "без расширения"
+            extensions[suffix] = extensions.get(suffix, 0) + 1
+            total += blobs.size(change.new_key) or 0
+        top = sorted(extensions.items(), key=lambda pair: (-pair[1], pair[0]))[:8]
+        size_note = f", {human_size(total)}" if total else ""
+        parts.append(
+            f"- A+ {name}/ — массовое добавление: {len(group)} файлов{size_note} "
+            f"({', '.join(f'{suffix}×{count}' for suffix, count in top)})"
+        )
+        listing, outline = evo_compact_listing([change.path for change in group])
+        parts.append(EvoItem(f"{name}/", listing, 0.5, outline, fence="text", tier=EVO_TIER_NARRATIVE))
+    for change in changes:
+        in_bulk = change.status == "A" and change.path.split("/", 1)[0] in bulk and "/" in change.path
+        stat, item = evo_change_item(change, blobs, evo_item_weight(change.path, base_weight) * recency)
+        if change.path in skip_body:
+            parts.append(f"- {stat} — текст приведён выше")
+        elif in_bulk:
+            # Файл массового добавления упоминается, только если на его тело хватило бюджета.
+            if item is not None:
+                item.tier = EVO_TIER_BULK
+                parts.append((f"- {stat}", item))
+        else:
+            parts.append(f"- {stat}")
+            if item is not None:
+                parts.append(item)
+    return parts
+
+
+def evo_step_title(step: EvoStep) -> tuple[str, str, str]:
+    """(вид, заголовок, slug) звена цепочки."""
+    if step.patches:
+        patch = step.patches[0]
+        title = patch.patch_id + (f" — {evo_one_line(patch.title, 140)}" if patch.title else "")
+        manifest_archive = (patch.manifest or {}).get("archive") if isinstance((patch.manifest or {}).get("archive"), dict) else {}
+        return "ПАТЧ", title, evo_slug(str(manifest_archive.get("nameSlug") or patch.patch_id))
+    if step.kind == "commit":
+        return "КОММИТ", evo_one_line(step.label, 160), evo_slug(step.label)[:60]
+    if step.kind == "snapshot":
+        return "СНИМОК", step.label, evo_slug(step.label)[:60]
+    return "РАБОЧЕЕ ДЕРЕВО", step.label, "worktree"
+
+
+def evo_render_event(event: EvoEvent, model: EvoModel, seq_of_step: dict[int, int], position: float) -> tuple[list[str], list[Any], str]:
+    """Строки для TIMELINE.md, части файла шага и slug имени файла. position — место события в истории, 0…1."""
+    # Диффы: свежая история подробно, давняя — перечнем затронутых объявлений. Связный текст
+    # (сводки патчей, заметки) стареет медленнее: по нему и восстанавливается ход мысли.
+    recency = 0.15 + 0.85 * position * position
+    told = 0.5 + 0.5 * position
+    stamp = evo_format_time(event.time)
+    head = f"- **{event.seq:04d}** · {stamp} · "
+    blobs = model.blobs
+    if event.kind == "step":
+        step: EvoStep = event.ref
+        kind, title, slug = evo_step_title(step)
+        commit = f" · commit {short_sha(step.commit)}" if step.commit else ""
+        line = f"{head}{kind} · {title}{commit} · {evo_counts(step.changes)}"
+        extra: list[str] = []
+        summary = ""
+        if step.patches:
+            summary = evo_one_line((step.patches[0].manifest or {}).get("summary"), 320)
+        if summary:
+            extra.append(f"  - {summary}")
+        clean = [copy for copy in step.copies if copy.exact]
+        dirty = [copy for copy in step.copies if not copy.exact]
+        if dirty:
+            extra.append(f"  - копий этого состояния с локальными изменениями: {len(dirty)}")
+        failed = [run for run in step.runs if run.status not in {"applied", "sync"}]
+        if failed:
+            extra.append(f"  - запуски с проблемой: {', '.join(sorted({run.status for run in failed}))}")
+        detail: list[Any] = [f"# {event.seq:04d} · {stamp} · {kind} · {title}", ""]
+        if step.time_source != "git":
+            detail.append(f"- время взято из: {step.time_source}")
+        if step.commit:
+            author = step.author if step.author and step.author != model.git_info.get("mainAuthor") else ""
+            detail.append(f"- commit: `{short_sha(step.commit, 12)}`" + (f" · автор: {author}" if author else ""))
+        for patch in step.patches:
+            # Трейлер коммита — обычная и самая надёжная связь; оговаривается только иная.
+            link = "" if patch.link == "трейлер коммита" else f" · sha256 `{patch.sha256[:16]}…` · связь: {patch.link}"
+            detail.append(f"- патч: `{patch.rel}`{link}")
+        for run in step.runs:
+            checks = "; ".join(f"{name}: {status}" for name, status, _code in run.checks) or "проверок нет в отчёте"
+            where = f"`{run.rel}`" if run.archived else f"{Path(run.rel).name[:15]} (каталог запуска удалён)"
+            detail.append(f"- запуск {where}: {run.status} · {evo_one_line(checks, 400)}")
+        for witness in step.witnesses:
+            detail.append(f"- свидетель: {witness}")
+        if clean:
+            # Служебные копии devctl создаёт сам после каждого патча: достаточно их числа.
+            named = [f"`{copy.rel}`" for copy in clean if not copy.infra]
+            uts = sum(1 for copy in clean if copy.infra and copy.origin == "dir")
+            snapshots = sum(1 for copy in clean if copy.infra and copy.origin == "zip")
+            notes = named[:8] + ([f"UserTestSpace ×{uts}"] if uts else []) + ([f"архивы-снимки ×{snapshots}"] if snapshots else [])
+            detail.append(f"- точные копии: {', '.join(notes)}")
+        body = EVO_TRAILER_RE.sub("", step.body or "").strip()
+        for patch in step.patches:
+            manifest = patch.manifest or {}
+            full_summary = str(manifest.get("summary") or "").strip()
+            if full_summary and evo_one_line(full_summary, 100000) != summary:
+                # Короткая сводка уже стоит в TIMELINE.md; здесь она нужна, только если там её пришлось обрезать.
+                detail.extend(["", "## Сводка патча", "", full_summary])
+            if patch.summary_md:
+                lines = [evo_clip(text) for text in patch.summary_md.splitlines()]
+                item = EvoItem("PATCH_SUMMARY.md", lines, told, evo_outline(lines, "x.md"), fence="markdown", tier=EVO_TIER_NARRATIVE)
+                detail.append(("\n## PATCH_SUMMARY.md\n", item))
+        if body and not step.patches:
+            detail.extend(["", "## Сообщение коммита", "", body])
+        detail.extend(["", f"## Изменения: {evo_counts(step.changes)}", ""])
+        shown_above = frozenset({"PATCH_SUMMARY.md"}) if any(patch.summary_md for patch in step.patches) else frozenset()
+        detail.extend(evo_render_changes(step.changes, blobs, 1.0, recency, shown_above))
+        if dirty:
+            detail.extend(["", "## Копии этого состояния с локальными изменениями", ""])
+            for copy in dirty:
+                detail.extend(evo_render_dirty_copy(copy, blobs, recency))
+        return [line, *extra], detail, slug
+    if event.kind == "run":
+        run: EvoRun = event.ref
+        # Применённый запуск без звена цепочки: его коммита нет в истории и копий состояния не осталось.
+        label = {"sync": "SYNC"}.get(run.kind, "ЗАПУСК БЕЗ РЕЗУЛЬТАТА" if run.status != "applied" else "ПАТЧ ПРИМЕНЁН, СОСТОЯНИЕ НЕ СОХРАНИЛОСЬ")
+        title = f"{run.patch_id or run.rel}" + (f" — {evo_one_line(run.title, 120)}" if run.title else "")
+        line = f"{head}{label} · {title} · статус {run.status}"
+        # Абсолютный путь к логу в строке хронологии не нужен: он есть в файле шага.
+        extra = ["  - " + evo_one_line(EVO_SEE_LOG_RE.sub("", run.errors[0]), 300)] if run.errors else []
+        if run.kind != "sync" and run.status == "applied":
+            extra.append("  - изменения этого патча входят в следующее сохранившееся состояние проекта")
+        kept: EvoPatch | None = run.patch
+        summary = evo_one_line((kept.manifest or {}).get("summary"), 320) if kept is not None else ""
+        if summary:
+            extra.append(f"  - {summary}")
+        detail = [f"# {event.seq:04d} · {stamp} · {label} · {title}", "", f"- каталог запуска: `{run.rel}`" + ("" if run.archived else " (на диске отсутствует, запись из .devctl/state.json)")]
+        if kept is not None:
+            detail.append(f"- файл патча сохранился: `{kept.rel}`")
+        elif run.patch_file:
+            detail.append(f"- файл патча: `{run.patch_file}` (в workspace его больше нет)")
+        if run.patch_sha256:
+            detail.append(f"- sha256 патча: `{run.patch_sha256[:16]}`")
+        if run.commit:
+            detail.append(f"- commit: `{run.commit}`")
+        for name, status, code in run.checks:
+            detail.append(f"- проверка «{evo_one_line(name, 160)}»: {status} (код {code or '—'})")
+        for error in run.errors:
+            detail.append(f"- ошибка: {error}")
+        if run.fail_tail:
+            detail.append(("\n## Хвост лога упавшей проверки\n", EvoItem("log", run.fail_tail, 0.5 * recency, fence="text")))
+        if kept is not None:
+            if kept.summary_md:
+                lines = [evo_clip(text) for text in kept.summary_md.splitlines()]
+                item = EvoItem("PATCH_SUMMARY.md", lines, 0.7 * told, evo_outline(lines, "x.md"), fence="markdown", tier=EVO_TIER_NARRATIVE)
+                detail.append(("\n## PATCH_SUMMARY.md\n", item))
+            names = sorted(kept.overlay)
+            detail.extend(["", "## Файлы патча", "", ", ".join(f"`{name}`" for name in names[:40]) + (f" … ещё {len(names) - 40}" if len(names) > 40 else "")])
+        has_detail = bool(run.checks or run.errors or run.fail_tail or kept is not None)
+        return [line, *extra], detail if has_detail else [], evo_slug(run.patch_id or "run")[:60]
+    if event.kind == "patch":
+        patch: EvoPatch = event.ref
+        title = patch.patch_id + (f" — {evo_one_line(patch.title, 140)}" if patch.title else "")
+        line = f"{head}ПАТЧ БЕЗ СЛЕДА ПРИМЕНЕНИЯ · {title} · `{patch.rel}`"
+        summary = evo_one_line((patch.manifest or {}).get("summary"), 320)
+        extra = [f"  - {summary}"] if summary else []
+        if patch.manifest_error:
+            extra.append(f"  - манифест: {patch.manifest_error}")
+        detail = [
+            f"# {event.seq:04d} · {stamp} · ПАТЧ БЕЗ СЛЕДА ПРИМЕНЕНИЯ · {title}", "",
+            f"- файл: `{patch.rel}` · sha256 `{patch.sha256[:16]}…` · время: {patch.time_source}",
+            "- в истории нет ни коммита с трейлером этого патча, ни состояния, где все его файлы присутствуют одновременно",
+        ]
+        present = sum(1 for path, key in patch.overlay.items() if model.final_tree.get(path) == key)
+        detail.append(f"- файлов в патче: {len(patch.overlay)}; из них в итоговом состоянии с тем же содержимым: {present}")
+        full_summary = str((patch.manifest or {}).get("summary") or "").strip()
+        if full_summary and evo_one_line(full_summary, 100000) != summary:
+            detail.extend(["", "## Сводка патча", "", full_summary])
+        if patch.summary_md:
+            lines = [evo_clip(text) for text in patch.summary_md.splitlines()]
+            item = EvoItem("PATCH_SUMMARY.md", lines, 0.7 * told, evo_outline(lines, "x.md"), fence="markdown", tier=EVO_TIER_NARRATIVE)
+            detail.append(("\n## PATCH_SUMMARY.md\n", item))
+        names = sorted(patch.overlay)
+        detail.extend(["", "## Файлы патча", "", ", ".join(f"`{name}`" for name in names[:40]) + (f" … ещё {len(names) - 40}" if len(names) > 40 else "")])
+        return [line, *extra], detail, evo_slug(patch.patch_id)[:60]
+    if event.kind == "copy":
+        copy: EvoCopy = event.ref
+        target = seq_of_step.get(copy.step if copy.step is not None else -1, 0)
+        state = "точная копия" if copy.exact else f"с локальными изменениями ({evo_counts(copy.changes)})"
+        what = "АРХИВ-СНИМОК" if copy.origin == "zip" else "КОПИЯ ПРОЕКТА"
+        line = f"{head}{what} · `{copy.rel}` = состояние шага {target:04d}, {state}"
+        return [line], [], "copy"
+    items: list[EvoLoose] = event.members
+    first = items[0]
+    if len(items) > 1:
+        parent = first.rel.rsplit("/", 1)[0]
+        listed = ", ".join(f"{item.rel.rsplit('/', 1)[-1]} ({human_size(item.size)})" for item in items[:8])
+        more = f" … ещё {len(items) - 8}" if len(items) > 8 else ""
+        return [f"{head}ФАЙЛЫ · `{parent}/` · {len(items)} шт.: {listed}{more}"], [], "files"
+    if first.kind == "dir":
+        span = f", изменения до {evo_format_time(first.time_end)}" if first.time_end and first.time_end - first.time > 3600 else ""
+        line = f"{head}КАТАЛОГ · `{first.rel}` · {first.files} файлов, {human_size(first.size)}{span}"
+        return [line, *[f"  - {text}" for text in first.detail]], [], "dir"
+    line = f"{head}ФАЙЛ · `{first.rel}` · {human_size(first.size)}"
+    extra = [f"  - {text}" for text in first.detail]
+    detail = []
+    if evo_is_note(first) and first.path is not None:
+        try:
+            text_lines = evo_text_lines(first.path.read_bytes())
+        except OSError:
+            text_lines = None
+        if text_lines:
+            lines = [evo_clip(text) for text in text_lines]
+            while lines and not lines[-1]:
+                lines.pop()
+            depth = first.rel.count("/")
+            is_doc = Path(first.rel).suffix.lower() in EVO_NOTE_SUFFIXES
+            weight = (0.6 if depth == 0 else 0.25) * (1.0 if is_doc else 0.4) * told
+            detail = [f"# {event.seq:04d} · {stamp} · ФАЙЛ · {first.rel}", "", f"- размер: {human_size(first.size)}; время по mtime файла", ""]
+            detail.append(EvoItem(first.rel, lines, weight, evo_outline(lines, first.rel), fence="text", tier=EVO_TIER_NARRATIVE))
+    return [line, *extra], detail, evo_slug(Path(first.rel).stem)[:60] or "file"
+
+
+def evo_render_dirty_copy(copy: EvoCopy, blobs: EvoBlobStore, recency: float) -> list[Any]:
+    parts: list[Any] = [f"### `{copy.rel}` · {evo_format_time(copy.time)} ({copy.time_source}) · {evo_counts(copy.changes)}", ""]
+    added = [change for change in copy.changes if change.status == "A"]
+    if added:
+        groups: dict[str, list[int]] = {}
+        for change in added:
+            top = change.path.split("/", 1)[0] + ("/" if "/" in change.path else "")
+            entry = groups.setdefault(top, [0, 0])
+            entry[0] += 1
+            entry[1] += copy.sizes.get(change.path, 0)
+        text = ", ".join(f"{name} ×{count} ({human_size(size)})" for name, (count, size) in sorted(groups.items())[:16])
+        parts.append(f"- появилось в копии: {text}")
+    removed = [change.path for change in copy.changes if change.status == "D"]
+    if removed:
+        parts.append(f"- отсутствует в копии: {', '.join(removed[:12])}{' …' if len(removed) > 12 else ''}")
+    if copy.skipped_files:
+        parts.append(f"- не сравнивалось по правилам снимков: {copy.skipped_files} файлов ({human_size(copy.skipped_bytes)})")
+    for change in copy.changes:
+        if change.status not in {"M", "R"}:
+            continue
+        stat, item = evo_change_item(change, blobs, evo_item_weight(change.path, 0.25) * recency)
+        parts.append(f"- {stat}")
+        if item is not None:
+            parts.append(item)
+    parts.append("")
+    return parts
+
+
+def evo_compact_listing(paths: list[str], width: int = 220) -> tuple[list[str], list[str]]:
+    """Перечень путей, сгруппированный по каталогам: `каталог/: имя, имя, …`. Второй результат — счётчики подкаталогов."""
+    by_dir: dict[str, list[str]] = {}
+    for path in sorted(paths):
+        parent, _slash, name = path.rpartition("/")
+        by_dir.setdefault(parent, []).append(name)
+    lines: list[str] = []
+    for parent, names in by_dir.items():
+        current = f"{parent}/:"
+        for position, name in enumerate(names):
+            piece = f" {name}" + ("," if position + 1 < len(names) else "")
+            if len(current) + len(piece) > width and not current.endswith(":"):
+                lines.append(current)
+                current = "   "
+            current += piece
+        lines.append(current)
+    counts: dict[str, int] = {}
+    for path in paths:
+        parts = path.split("/")
+        key = "/".join(parts[:2]) + "/" if len(parts) > 2 else parts[0] + "/"
+        counts[key] = counts.get(key, 0) + 1
+    outline = [f"{key} ×{count}" for key, count in sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))]
+    return lines, outline
+
+
+def evo_flatten(parts: list[Any], detail: tuple[float, float, float]) -> list[str]:
+    lines: list[str] = []
+    for part in parts:
+        if isinstance(part, tuple):
+            # Заголовок или строка статистики печатается, только если уцелело само тело.
+            prefix, item = part
+            body = item.render(detail[item.tier])
+            if body:
+                lines.append(prefix)
+                lines.extend(body)
+        elif isinstance(part, EvoItem):
+            lines.extend(part.render(detail[part.tier]))
+        else:
+            lines.append(str(part))
+    return lines
+
+
+def evo_parts_cost(parts: list[Any], detail: float, tier: int | None) -> int:
+    """Объём частей одного класса; tier=None — постоянные строки, которые печатаются при любом бюджете."""
+    total = 0
+    for part in parts:
+        if isinstance(part, tuple):
+            if part[1].tier == tier:
+                cost = part[1].cost(detail)
+                total += cost + (len(part[0].encode("utf-8")) + 1 if cost else 0)
+        elif isinstance(part, EvoItem):
+            if part.tier == tier:
+                total += part.cost(detail)
+        elif tier is None:
+            total += len(str(part).encode("utf-8")) + 1
+    return total
+
+
+def evo_fit_detail(all_parts: list[list[Any]], fixed: int, budget: int) -> tuple[tuple[float, float, float], int]:
+    """Коэффициенты детализации трёх классов содержимого и объём каркаса.
+
+    Каркас (хронология, заголовки шагов, статистика по файлам) печатается всегда. Остаток бюджета
+    делится по очереди: повествование — сводки патчей, заметки, перечни файлов — получает до 60%;
+    затем идут диффы; массовые добавления (первый импорт, вендоренный код) берут то, что осталось,
+    но за ними придержана десятая часть, и подробнее обычных диффов они не бывают. Неистраченное
+    возвращается в том же порядке.
+    """
+    for parts in all_parts:
+        for part in parts:
+            item = part[1] if isinstance(part, tuple) else part
+            if isinstance(item, EvoItem) and not item.costs:
+                item.prepare()
+    ceiling = EVO_DETAIL_CEILING
+    skeleton = fixed + sum(evo_parts_cost(parts, 0.0, None) for parts in all_parts)
+    if budget <= 0:
+        return (ceiling, ceiling, ceiling), skeleton
+
+    def total(detail: float, tier: int) -> int:
+        return sum(evo_parts_cost(parts, detail, tier) for parts in all_parts)
+
+    def fit(limit: float, tier: int, upper: float = ceiling) -> float:
+        if total(upper, tier) <= limit:
+            return upper
+        low, high = 0.0, upper
+        for _ in range(40):
+            middle = (low + high) / 2
+            if total(middle, tier) <= limit:
+                low = middle
+            else:
+                high = middle
+        return low
+
+    free = max(0, budget - skeleton)
+    narrative = fit(free * EVO_NARRATIVE_SHARE, EVO_TIER_NARRATIVE)
+    spent_narrative = total(narrative, EVO_TIER_NARRATIVE)
+    main = fit(free - spent_narrative - free * EVO_BULK_RESERVE, EVO_TIER_MAIN)
+    spent_main = total(main, EVO_TIER_MAIN)
+    bulk = fit(free - spent_narrative - spent_main, EVO_TIER_BULK, max(main, 1e-9))
+    spent_bulk = total(bulk, EVO_TIER_BULK)
+    left = free - spent_narrative - spent_main - spent_bulk
+    if left > 0 and main < ceiling:
+        main = fit(spent_main + left, EVO_TIER_MAIN)
+        left -= total(main, EVO_TIER_MAIN) - spent_main
+    if left > 0 and narrative < ceiling:
+        narrative = fit(spent_narrative + left, EVO_TIER_NARRATIVE)
+        left -= total(narrative, EVO_TIER_NARRATIVE) - spent_narrative
+    if left > 0 and bulk < ceiling:
+        bulk = fit(spent_bulk + left, EVO_TIER_BULK, max(main, 1e-9))
+    return (narrative, main, bulk), skeleton
+
+
+def evo_final_tree_summary(tree: dict[str, str]) -> list[str]:
+    groups: dict[str, int] = {}
+    for path in tree:
+        top = path.split("/", 1)[0] + ("/" if "/" in path else "")
+        groups[top] = groups.get(top, 0) + 1
+    return [f"- `{name}`" + (f" — файлов: {count}" if name.endswith("/") else "") for name, count in sorted(groups.items())]
+
+
+def evo_detail_text(value: float) -> str:
+    return "без сокращений" if value >= EVO_DETAIL_CEILING else f"{value:.2f}"
+
+
+def evo_readme(model: EvoModel, events: list[EvoEvent], stats: dict[str, Any]) -> list[str]:
+    workspace = model.workspace
+    git_info = model.git_info
+    offset = datetime.now().astimezone().strftime("%z")
+    kinds = stats["eventKinds"]
+    lines = [
+        f"# Эволюция workspace «{workspace.workspace_root.name}»",
+        "",
+        f"Собрано `devctl zip` (devctl {DEVCTL_VERSION}, формат {EVO_FORMAT_VERSION}) {evo_format_time(time.time())} UTC{offset[:3]}:{offset[3:]}.",
+        "Архив описывает, как менялись проект и окружающие его материалы на этой машине, в хронологическом порядке.",
+        "",
+        "## Как читать",
+        "",
+        "1. `TIMELINE.md` — вся хронология: одна запись на событие, номера сквозные.",
+        "2. `steps/NNNN_*.md` — подробности события с тем же номером: сводка патча, изменения файлов, диффы, текст заметок.",
+        "3. `index.json` — короткий машинный указатель: событие → файл, коммит, патч, копии. Для понимания истории не нужен.",
+        "",
+        "Проект хранится как цепочка состояний. Каждое состояние описано только отличием от предыдущего, поэтому",
+        "содержимое файла на любой момент — это его последнее появление (`A` или «переписан») плюс следующие диффы.",
+        "",
+        "Обозначения: `A` добавлен, `M` изменён, `D` удалён, `R` переименован без изменений, `A+` массовое добавление каталога.",
+        "«… опущено строк» и строки вида «(затронуто: …)» означают, что тело сокращено под бюджет; полный текст",
+        "восстановим по указанному пути и коммиту либо из копии состояния (раздел «Как достать опущенное»).",
+        "Строка изменения без тела под ней — тело не поместилось: остались путь и число строк.",
+        "",
+        "## Что вошло",
+        "",
+        f"- workspace: `{workspace.workspace_root}`; проект: `{rel_display(workspace.project_root, workspace.workspace_root) or '.'}`",
+        f"- просмотрено: {stats['scannedFiles']} файлов, {human_size(stats['scannedBytes'])}"
+        + (f"; служебный кэш пропущен: {model.scan.junk_files} файлов ({human_size(model.scan.junk_bytes)})" if model.scan.junk_files else ""),
+        f"- событий в хронологии: {len(events)} — состояний проекта {kinds.get('step', 0)}, заметок и материалов {kinds.get('loose', 0)}, "
+        f"копий вне UserTestSpace/archives {kinds.get('copy', 0)}, патчей без следа применения {kinds.get('patch', 0)}, "
+        f"запусков без результата {kinds.get('run', 0)}",
+        f"- патчей найдено: {len(model.patches)}, из них привязано к состояниям: {sum(1 for patch in model.patches if patch.step is not None)}",
+        f"- копий проекта (каталоги и архивы-снимки): {len(model.copies)}, из них точных: {sum(1 for copy in model.copies if copy.exact)}, "
+        f"с локальными изменениями: {sum(1 for copy in model.copies if not copy.exact)}",
+    ]
+    if git_info.get("available"):
+        lines.append(
+            f"- Git: {git_info.get('commits')} коммитов по первой родительской линии, ветка `{git_info.get('branch')}`, "
+            f"HEAD `{short_sha(git_info.get('head'), 12)}`" + (f", origin {git_info.get('remoteUrl')}" if git_info.get("remoteUrl") else "")
+            + (f"; автор коммитов, если в шаге не указан другой: {git_info.get('mainAuthor')}" if git_info.get("mainAuthor") else "")
+        )
+        if git_info.get("otherRefs"):
+            lines.append(f"- другие ветки и теги ({git_info.get('otherRefs')}) в цепочку не включены")
+    else:
+        lines.append("- Git-истории нет: цепочка состояний собрана из архивов-снимков и копий проекта по времени")
+    lines.extend([
+        "",
+        "## Сжатие",
+        "",
+        f"- уровень: {stats['level']}; бюджет текста: {'без ограничения' if not stats['budgetBytes'] else human_size(stats['budgetBytes'])}",
+        f"- получилось текста: {human_size(stats['textBytes'])} (≈ {stats['approxTokens']} токенов), из них каркас — "
+        f"хронология, заголовки шагов, статистика по файлам — {human_size(stats['skeletonBytes'])};",
+        *(["  бюджет меньше каркаса: тела изменений не поместились, остались только пути и числа строк;"] if stats.get("overBudget") else []),
+        f"  коэффициенты детализации: сводки и заметки {evo_detail_text(stats['detailNarrative'])}, диффы {evo_detail_text(stats['detail'])}, "
+        f"массовые добавления {evo_detail_text(stats['detailBulk'])} (1.00 ≈ {EVO_BASE_CAP_LINES} строк на файл исходного кода в последнем шаге)",
+        f"- тел показано полностью: {stats['itemsFull']}, сокращено: {stats['itemsCut']}, только статистикой: {stats['itemsHidden']}",
+        "- каркас печатается всегда; из остатка бюджета до 60% получают сводки патчей, заметки и перечни файлов,",
+        "  затем диффы, затем массовые добавления (первый импорт, вендоренный код);",
+        "  свежие шаги и исходный код получают больше строк, чем старые шаги, тесты, документация и данные:",
+        "  недавние диффы видны телом, давние — перечнем затронутых объявлений.",
+        "- одинаковые деревья файлов (коммит, копия в UserTestSpace, pre/post-архив, ручная копия) считаются одним состоянием;",
+        "  окончания строк CRLF/LF при сравнении не учитываются.",
+        "",
+        "## Время",
+        "",
+        f"- время показано в часовом поясе машины сборки (UTC{offset[:3]}:{offset[3:]}).",
+        "- у коммитов — время коммита; у копий и запусков — метка из имени, записанная devctl по местному времени;",
+        "  у остальных файлов — время последнего изменения (mtime). Перенос между машинами мог сдвинуть mtime.",
+        "",
+        "## Как достать опущенное",
+        "",
+        "- файл на момент коммита: `git -C <проект> show <commit>:<путь>`;",
+        "- «ключ» у двоичных файлов — начало идентификатора Git blob: `git -C <проект> cat-file -p <ключ>`;",
+        "- копии состояний: `UserTestSpace/project_<время>_after_<slug>_<коммит>/project` и `post_*.zip` в каталоге запуска из файла шага;",
+        "- ручные копии и снимки лежат в workspace по путям, указанным в хронологии.",
+        "",
+        "## Итоговое состояние проекта",
+        "",
+        f"Файлов: {len(model.final_tree)}. Верхний уровень:",
+        "",
+        *evo_final_tree_summary(model.final_tree),
+    ])
+    if stats.get("finalIncluded"):
+        lines.extend(["", f"Текстовые файлы итогового состояния приложены в `final/` ({stats['finalIncluded']} файлов)."])
+    if model.scan.own_archives:
+        lines.extend(["", f"Прежние эволюционные архивы в workspace ({model.scan.own_archives}) пропущены."])
+    if model.scan.warnings:
+        lines.extend(["", "## Предупреждения сканирования", ""])
+        lines.extend(f"- {warning}" for warning in model.scan.warnings[:40])
+    return lines
+
+
+def evo_index(model: EvoModel, events: list[EvoEvent], stats: dict[str, Any]) -> dict[str, Any]:
+    """Машинный указатель. Он нарочно мал: всё содержательное уже есть в тексте, а архив читают целиком."""
+    seq_of_step = {event.ref.index: event.seq for event in events if event.kind == "step"}
+    file_of_step = {event.ref.index: event.file for event in events if event.kind == "step"}
+    states = []
+    for step in model.chain:
+        clean = [copy for copy in step.copies if copy.exact]
+        states.append([
+            seq_of_step.get(step.index), step.kind, int(step.time), short_sha(step.commit, 12) if step.commit else None,
+            [patch.patch_id for patch in step.patches], file_of_step.get(step.index),
+            sum(1 for copy in clean if copy.infra and copy.origin == "dir"),
+            sum(1 for copy in clean if copy.infra and copy.origin == "zip"),
+            [copy.rel for copy in clean if not copy.infra],
+            [copy.rel for copy in step.copies if not copy.exact],
+        ])
+    return {
+        "devctlEvolution": EVO_FORMAT_VERSION,
+        "devctlVersion": DEVCTL_VERSION,
+        "generatedAt": iso_now(),
+        "workspace": {
+            "name": model.workspace.workspace_root.name,
+            "root": str(model.workspace.workspace_root),
+            "projectDir": rel_display(model.workspace.project_root, model.workspace.workspace_root),
+        },
+        "git": model.git_info,
+        "stats": stats,
+        "stateColumns": ["n", "kind", "time", "commit", "patches", "file", "utsCopies", "snapshotZips", "otherCopies", "dirtyCopies"],
+        "states": states,
+        "unlinkedPatches": [patch.rel for patch in model.patches if patch.step is None],
+    }
+
+
+def evo_build_archive(model: EvoModel, *, level: str, budget_bytes: int, with_final: bool) -> tuple[dict[str, bytes], dict[str, Any]]:
+    events = evo_build_events(model)
+    seq_of_step = {event.ref.index: event.seq for event in events if event.kind == "step"}
+    timeline: list[str] = []
+    details: list[tuple[EvoEvent, list[Any], str]] = []
+    count = max(len(events) - 1, 1)
+    for position, event in enumerate(events):
+        lines, parts, slug = evo_render_event(event, model, seq_of_step, position / count)
+        if parts:
+            event.file = f"steps/{event.seq:04d}_{slug or 'event'}.md"
+            lines[0] += " →"
+            details.append((event, parts, slug))
+        timeline.extend(lines)
+    header = [
+        f"# Хронология workspace «{model.workspace.workspace_root.name}»",
+        "",
+        "Одна запись — одно событие. Стрелка → в конце записи: подробности лежат в `steps/<номер>_*.md`. Обозначения — в README.md.",
+        "",
+    ]
+    timeline_text = "\n".join([*header, *timeline]) + "\n"
+    index_size = len(json.dumps(evo_index(model, events, {}), ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + 700
+    fixed = len(timeline_text.encode("utf-8")) + index_size + 6500
+    detail, skeleton = evo_fit_detail([parts for _event, parts, _slug in details], fixed, budget_bytes)
+    files: dict[str, bytes] = {"TIMELINE.md": timeline_text.encode("utf-8")}
+    items_full = items_cut = items_hidden = 0
+    for event, parts, _slug in details:
+        for part in parts:
+            item = part[1] if isinstance(part, tuple) else part
+            if isinstance(item, EvoItem) and item.lines:
+                cap = item.cap(detail[item.tier])
+                if len(item.lines) <= cap:
+                    items_full += 1
+                elif cap >= item.head_min() or (cap >= 2 and item.outline):
+                    items_cut += 1
+                else:
+                    items_hidden += 1
+        assert event.file is not None
+        files[event.file] = ("\n".join(evo_flatten(parts, detail)).rstrip() + "\n").encode("utf-8")
+    final_included = 0
+    if with_final:
+        for path, key in sorted(model.final_tree.items()):
+            data = model.blobs.read(key, 512 * 1024)
+            if data is not None and evo_is_text_bytes(data):
+                files[f"final/{path}"] = data
+                final_included += 1
+    text_bytes = sum(len(data) for name, data in files.items() if not name.startswith("final/"))
+    kinds: dict[str, int] = {}
+    for event in events:
+        kinds[event.kind] = kinds.get(event.kind, 0) + 1
+    stats: dict[str, Any] = {
+        "level": level, "budgetBytes": budget_bytes, "skeletonBytes": skeleton, "overBudget": bool(budget_bytes and skeleton > budget_bytes),
+        "detailNarrative": round(detail[0], 4), "detail": round(detail[1], 4), "detailBulk": round(detail[2], 4),
+        "events": len(events), "eventKinds": kinds,
+        "scannedFiles": model.scan.total_files, "scannedBytes": model.scan.total_bytes,
+        "itemsFull": items_full, "itemsCut": items_cut, "itemsHidden": items_hidden, "finalIncluded": final_included,
+    }
+    for _ in range(3):  # README и index.json входят в объём, который сами же и сообщают
+        stats["textBytes"] = text_bytes + len(files.get("README.md", b"")) + len(files.get("index.json", b""))
+        stats["approxTokens"] = int(stats["textBytes"] / 3.2)
+        files["README.md"] = ("\n".join(evo_readme(model, events, stats)) + "\n").encode("utf-8")
+        files["index.json"] = (json.dumps(evo_index(model, events, stats), ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    return files, stats
+
+
+def zip_command(args: argparse.Namespace) -> int:
+    json_enabled = bool(getattr(args, "json", False))
+    quiet = bool(getattr(args, "quiet", False)) or json_enabled
+    payload: dict[str, Any] = {"ok": False, "version": DEVCTL_VERSION, "archive": None}
+    model: EvoModel | None = None
+    try:
+        workspace = discover_workspace(workspace_arg_from_namespace(args))
+        if not workspace.workspace_root.is_dir():
+            raise DevctlError(f"Workspace не найден: {workspace.workspace_root}")
+        if not (workspace.state_dir / "workspace.json").is_file():
+            # Без конфигурации корнем workspace считается родитель проекта — случайный каталог,
+            # который незачем ни просматривать целиком, ни пополнять архивом.
+            raise DevctlError(
+                f"В {workspace.workspace_root} нет .devctl/workspace.json. `devctl zip` работает в инициализированном "
+                "workspace: перейдите в него, укажите -w <workspace> или выполните `devctl init`."
+            )
+        level = str(getattr(args, "level", None) or EVO_DEFAULT_LEVEL)
+        budget_kb = getattr(args, "budget_kb", None)
+        if budget_kb is not None and budget_kb < 0:
+            raise DevctlError("--budget-kb не может быть отрицательным")
+        budget_bytes = (EVO_LEVELS[level] if budget_kb is None else int(budget_kb)) * 1024
+        if budget_kb is not None:
+            level = f"бюджет {budget_kb} КиБ"
+        if not quiet:
+            print_header("devctl zip")
+            print(f"Workspace: {workspace.workspace_root}")
+        model = evo_collect(workspace, quiet=quiet)
+        evo_progress("[4/5] Диффы и подгонка под бюджет…", quiet=quiet)
+        files, stats = evo_build_archive(model, level=level, budget_bytes=budget_bytes, with_final=bool(getattr(args, "with_final", False)))
+        payload.update({"workspace": workspace_to_json(workspace), "stats": stats, "dryRun": bool(getattr(args, "dry_run", False))})
+        destination: Path | None = None
+        if not getattr(args, "dry_run", False):
+            evo_progress("[5/5] Запись архива…", quiet=quiet)
+            name = f"{evo_slug(workspace.workspace_root.name, 'workspace')}{EVO_ARCHIVE_INFIX}{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+            output = getattr(args, "output", None)
+            if output:
+                destination = expand_user_path(output)
+                if destination.is_dir() or str(output).endswith(("/", "\\")):
+                    destination = destination / name
+            elif model.scan.same_root:
+                # Корень workspace совпадает с Git-проектом: новый файл в нём сделал бы дерево «грязным».
+                destination = workspace.archives_dir / name
+            else:
+                destination = workspace.workspace_root / name
+            destination = unique_path(destination.resolve())
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_name(destination.name + ".tmp")
+            with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+                for member in ["README.md", "TIMELINE.md", *sorted(name for name in files if name not in {"README.md", "TIMELINE.md"})]:
+                    info = zipfile.ZipInfo(member, date_time=time.localtime()[:6])
+                    info.compress_type = zipfile.ZIP_DEFLATED
+                    info.external_attr = 0o644 << 16
+                    archive.writestr(info, files[member])
+            temporary.replace(destination)
+            payload["archive"] = str(destination)
+            payload["archiveBytes"] = destination.stat().st_size
+        payload["ok"] = True
+        if json_enabled:
+            emit_json(payload)
+        else:
+            kinds = stats["eventKinds"]
+            print(f"Событий:   {stats['events']} (состояний проекта {kinds.get('step', 0)}, прочих материалов {kinds.get('loose', 0)})")
+            print(
+                f"Текст:     {human_size(stats['textBytes'])} ≈ {stats['approxTokens']} токенов; детализация: сводки и заметки "
+                f"{evo_detail_text(stats['detailNarrative'])}, диффы {evo_detail_text(stats['detail'])}, массовые {evo_detail_text(stats['detailBulk'])}"
+            )
+            print(f"Тела:      полностью {stats['itemsFull']}, сокращено {stats['itemsCut']}, только статистикой {stats['itemsHidden']}")
+            if stats.get("overBudget"):
+                print(
+                    f"Внимание:  бюджет {human_size(stats['budgetBytes'])} меньше каркаса хронологии ({human_size(stats['skeletonBytes'])}): "
+                    "тела изменений не поместились. Увеличьте --level или --budget-kb."
+                )
+            if destination is not None:
+                size = destination.stat().st_size
+                ratio = stats["scannedBytes"] / size if size else 0
+                times = f" (в {ratio:,.0f} раз)".replace(",", " ") if ratio >= 2 else ""
+                print(f"Сжатие:    {human_size(stats['scannedBytes'])} → {human_size(size)}{times}")
+                print(f"Архив:     {destination}")
+            else:
+                print("Dry-run:   архив не записан")
+            for warning in model.scan.warnings[:10]:
+                print(f"Предупреждение: {warning}")
+        return 0
+    except DevctlError as exc:
+        payload["error"] = str(exc)
+        if json_enabled:
+            emit_json(payload)
+        else:
+            print(f"[ОШИБКА] {exc}")
+        return 2
+    finally:
+        if model is not None:
+            model.blobs.close()
+
+
+# ---------------------------------------------------------------------------
 # Release install / shell completion helpers
 # ---------------------------------------------------------------------------
 
@@ -5149,7 +7499,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser._positionals.title = "команды"
     parser._optionals.title = "параметры"
-    subparsers = parser.add_subparsers(dest="command", required=True, metavar="{init,sync,workspace,inbox,status,inspect,plan,start,reset,completion,self}")
+    subparsers = parser.add_subparsers(dest="command", required=True, metavar="{init,sync,workspace,inbox,status,inspect,plan,start,reset,zip,completion,self}")
 
     init = subparsers.add_parser("init", help="Создать или безопасно обновить структуру workspace")
     init.add_argument("--workspace", default=None, help="Корень рабочей области. По умолчанию текущий каталог.")
@@ -5217,6 +7567,18 @@ def build_parser() -> argparse.ArgumentParser:
     reset.add_argument("--target", default="HEAD", help="Git target для reset --hard. По умолчанию HEAD")
     reset.add_argument("--clean-mode", choices=("fd", "fdx"), default="fd", help="Режим git clean: fd или fdx. По умолчанию fd")
 
+    zip_cmd = subparsers.add_parser("zip", help="Собрать эволюционный архив workspace: вся история одним zip для чтения нейросетью")
+    zip_cmd.add_argument(
+        "--level", choices=tuple(EVO_LEVELS), default=EVO_DEFAULT_LEVEL,
+        help="Объём текста: brief ≈ 256 КиБ (~80 тыс. токенов), normal ≈ 512 КиБ (~160 тыс., по умолчанию), full ≈ 2 МиБ (~650 тыс.), max — без ограничения",
+    )
+    zip_cmd.add_argument("--budget-kb", type=int, default=None, help="Точный бюджет текста в КиБ вместо --level; 0 — без ограничения")
+    zip_cmd.add_argument("--output", default=None, help="Файл или каталог результата. По умолчанию корень workspace")
+    zip_cmd.add_argument("--with-final", action="store_true", help="Приложить текстовые файлы итогового состояния проекта в final/ (сверх бюджета)")
+    zip_cmd.add_argument("--dry-run", action="store_true", help="Посчитать и показать статистику, не записывая архив")
+    zip_cmd.add_argument("--quiet", action="store_true", help="Не печатать ход работы")
+    zip_cmd.add_argument("--json", action="store_true", help="Вывести машинно-читаемый JSON")
+
     completion = subparsers.add_parser("completion", help="Вывести shell completion для bash, zsh или fish")
     completion.add_argument("shell", choices=SHELLS, help="Оболочка, для которой нужно вывести completion-скрипт")
 
@@ -5261,6 +7623,8 @@ def main(argv: list[str] | None = None) -> int:
             return start_command(args)
         if args.command == "reset":
             return reset_command(args)
+        if args.command == "zip":
+            return zip_command(args)
         if args.command == "completion":
             return completion_command(args)
         if args.command == "self":
