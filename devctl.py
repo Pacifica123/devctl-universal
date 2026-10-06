@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-devctl v0.8.0 — проектно-независимый конвейер применения ИИ-патчей на чистом Python.
+devctl v0.9.0 — проектно-независимый конвейер применения ИИ-патчей на чистом Python.
 
 Базовый поток конвейера: применить патч -> выполнить проверки -> создать коммит -> отправить в remote.
 
@@ -9,7 +9,8 @@ devctl v0.8.0 — проектно-независимый конвейер пр�
     devctl status | inspect | plan   посмотреть состояние и патч без изменений
     devctl start | reset          применить патч или откатить проект
     devctl zip                    собрать эволюционный архив workspace для чтения нейросетью
-    devctl workspace | inbox      приём патчей из общего склада
+    devctl workspace | inbox      реестр workspace машины и приём патчей из общего склада
+    devctl batch                  пачка патчей для одного или нескольких workspace
     devctl self | completion      установка утилиты и shell completion
 
 Инструмент намеренно использует только стандартную библиотеку Python.
@@ -34,7 +35,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-DEVCTL_VERSION = "0.8.0"
+DEVCTL_VERSION = "0.9.0"
 STATE_VERSION = 1
 DEFAULT_PROJECT_DIR_NAME = "project"
 DEFAULT_PATCHES_DIR_NAME = "patches"
@@ -46,6 +47,8 @@ GLOBAL_CONFIG_VERSION = 1
 INBOX_SUBDIRS = ("incoming", "imported", "rejected", "duplicate")
 LEGACY_ARCHIVES_DIR_ALIASES = ("arhives",)
 PATCH_FILENAME_RE = re.compile(r"patch_(\d{8})_(\d{6})(?:_.*)?\.zip$", re.IGNORECASE)
+# Шаблоны env-файлов без секретов: их можно приносить патчем и коммитить.
+ENV_TEMPLATE_NAMES = {".env.example", ".env.sample", ".env.template", ".env.dist"}
 
 BANNED_PATH_PARTS = {".git", ".devctl", "target", "node_modules"}
 ARCHIVE_EXCLUDED_PARTS = {
@@ -206,6 +209,7 @@ class RunContext:
     uts_dir: Path | None = None
     uts_project_dir: Path | None = None
     uts_error: str | None = None
+    batch_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +249,11 @@ def slugify(value: str | None, fallback: str = "patch") -> str:
     text = re.sub(r"[^a-z0-9._-]+", "-", text)
     text = re.sub(r"-+", "-", text).strip("-._")
     return text or fallback
+
+
+def is_secret_env_name(name: str) -> bool:
+    """`.env` и `.env.*` считаются секретами, кроме шаблонов вроде `.env.example`."""
+    return name == ".env" or (name.startswith(".env.") and name not in ENV_TEMPLATE_NAMES)
 
 
 def short_sha(value: str | None, length: int = 7) -> str:
@@ -645,6 +654,8 @@ def build_inbox_scan(config: dict[str, Any]) -> dict[str, Any]:
         if not source_dir.exists() or not source_dir.is_dir():
             continue
         for path in source_dir.glob("*.zip"):
+            if zip_has_batch_manifest(path):
+                continue  # пачки принимает `devctl batch`, а не `inbox grab`
             manifest, error = read_manifest_from_zip(path)
             candidate = PatchCandidate(path=path, manifest=manifest, manifest_error=error, sort_key=candidate_sort_key(path, manifest))
             try:
@@ -797,10 +808,223 @@ def import_inbox_item(item: dict[str, Any], config: dict[str, Any], *, workspace
 # ---------------------------------------------------------------------------
 
 
+WORKSPACE_SCAN_SKIP_DIRS = {
+    "node_modules", "target", "dist", "build", "coverage", "__pycache__", "venv", "env",
+    "UserTestSpace", "archives", "arhives", "patches", "snap", "Library", "AppData",
+}
+WORKSPACE_STANDARD_KEYS = {
+    "version", "id", "workspaceId", "name", "projectName", "projectDir", "patchesDir", "archivesDir",
+    "userTestSpaceDir", "git", "archive", "checkProfiles",
+}
+
+
+def scan_for_workspaces(roots: list[Path], max_depth: int) -> list[Path]:
+    """Найти каталоги с `.devctl/workspace.json` под roots, не заходя в скрытые и сборочные каталоги."""
+    found: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        root = root.resolve()
+        if not root.is_dir():
+            continue
+        base_depth = len(root.parts)
+        for current, dirnames, _filenames in os.walk(root, topdown=True, followlinks=False):
+            current_path = Path(current)
+            if (current_path / ".devctl" / "workspace.json").is_file():
+                key = str(current_path)
+                if key not in seen:
+                    seen.add(key)
+                    found.append(current_path)
+            if len(current_path.parts) - base_depth >= max_depth:
+                dirnames[:] = []
+                continue
+            dirnames[:] = sorted(
+                name for name in dirnames
+                if not name.startswith(".") and name not in WORKSPACE_SCAN_SKIP_DIRS
+            )
+    return found
+
+
+def registered_record_for_path(config: dict[str, Any], path: Path) -> dict[str, Any] | None:
+    key = normalize_user_path_text(path)
+    for record in config.get("workspaces", []):
+        if isinstance(record, dict) and normalize_user_path_text(str(record.get("path", ""))) == key:
+            return record
+    return None
+
+
+def git_last_applied_patch(project_root: Path, limit: int = 200) -> dict[str, Any] | None:
+    if not (project_root / ".git").exists() or not git_available():
+        return None
+    result = git(project_root, ["log", f"-n{limit}", "--format=%H%x1f%cI%x1f%B%x1e"])
+    if result.returncode != 0:
+        return None
+    for chunk in result.stdout.split("\x1e"):
+        parts = chunk.strip("\n").split("\x1f")
+        if len(parts) < 3:
+            continue
+        match = re.search(r"^Patch-Id:\s*(\S+)", parts[2], re.MULTILINE)
+        if match:
+            return {"patchId": match.group(1), "commit": parts[0], "committedAt": parts[1]}
+    return None
+
+
+def workspace_agent_info(record: dict[str, Any]) -> dict[str, Any]:
+    """Всё, что нужно агенту, чтобы собрать патч или пачку против верной базы."""
+    info: dict[str, Any] = {"id": record.get("id"), "name": record.get("name"), "path": record.get("path")}
+    workspace, error = workspace_record_project(record)
+    if workspace is None:
+        info.update({"available": False, "error": error})
+        return info
+    info["available"] = True
+    info["projectDir"] = posix_rel_or_dot(workspace.project_root, workspace.workspace_root)
+    try:
+        cfg = read_json_file(workspace.state_dir / "workspace.json")
+    except DevctlError:
+        cfg = {}
+    git_cfg = cfg.get("git") if isinstance(cfg.get("git"), dict) else {}
+    info["pushBranch"] = git_cfg.get("branch")
+    info["autoPush"] = bool_from_config(git_cfg.get("autoPush"), True) and bool_from_config(git_cfg.get("enabled"), True)
+    extras = {key: value for key, value in cfg.items() if key not in WORKSPACE_STANDARD_KEYS}
+    if extras:
+        info["workspaceNotes"] = extras
+    project = workspace.project_root
+    if (project / ".git").exists() and git_available():
+        try:
+            info["branch"] = git_branch(project)
+            info["head"] = git_head(project)
+            info["dirty"] = bool(git_status_porcelain(project).strip())
+        except DevctlError as exc:
+            info["gitError"] = str(exc)
+        remote_url = git_remote_url(project)
+        if remote_url:
+            info["remote"] = evo_strip_url_credentials(remote_url)
+        info["lastAppliedPatch"] = git_last_applied_patch(project)
+    else:
+        info["gitError"] = "проект не является Git-репозиторием"
+    try:
+        state = load_state(workspace)
+    except DevctlError:
+        state = {"version": STATE_VERSION, "runs": []}
+    pending = [c.path.name for c in list_patch_candidates(workspace) if not candidate_applied(workspace, state, c)]
+    info["pendingPatches"] = pending
+    return info
+
+
+def render_workspaces_for_agent(items: list[dict[str, Any]]) -> str:
+    lines = [
+        f"# Workspace этой машины (devctl {DEVCTL_VERSION})",
+        "",
+        "Патч для одного workspace — обычный patch.zip (devctl docs/patch-format.md).",
+        "Несколько патчей сразу, в том числе для разных workspace, — пачка batch_*.zip (devctl docs/batch.md):",
+        "в batch.json укажите workspace (id ниже) и expectedHead = head ниже для первого патча каждого workspace.",
+        "",
+    ]
+    for item in items:
+        lines.append(f"## {item.get('id')} — {item.get('name')}")
+        if not item.get("available"):
+            lines.append(f"- недоступен: {item.get('error')}")
+            lines.append("")
+            continue
+        lines.append(f"- путь: {item.get('path')} (projectDir {item.get('projectDir')})")
+        if item.get("gitError"):
+            lines.append(f"- git: {item.get('gitError')}")
+        else:
+            dirty = ", есть незакоммиченные изменения" if item.get("dirty") else ""
+            lines.append(f"- ветка {item.get('branch')}, head {item.get('head')}{dirty}")
+            if item.get("remote"):
+                lines.append(f"- remote: {item.get('remote')}; push после коммита: {'да' if item.get('autoPush') else 'нет'}")
+            last = item.get("lastAppliedPatch")
+            lines.append(f"- последний применённый патч: {last.get('patchId')} ({str(last.get('commit'))[:12]})" if last else "- применённых патчей в истории нет")
+        pending = item.get("pendingPatches") or []
+        lines.append(f"- ждут в patches/: {', '.join(pending) if pending else 'ничего'}")
+        notes = item.get("workspaceNotes")
+        if notes:
+            lines.append("- правила workspace: " + json.dumps(notes, ensure_ascii=False))
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def workspace_scan_command(args: argparse.Namespace) -> int:
+    config = load_global_config()
+    roots = [expand_user_path(raw) for raw in (args.roots or [])] or [user_home()]
+    found = scan_for_workspaces(roots, max(1, int(args.depth)))
+    items: list[dict[str, Any]] = []
+    changed = False
+    for path in found:
+        item: dict[str, Any] = {"path": str(path)}
+        try:
+            workspace = discover_workspace_from_config(path / ".devctl" / "workspace.json")
+            item["id"] = workspace_display_id(workspace)
+            item["name"] = workspace_display_name(workspace)
+            validate_workspace_registerable(workspace)
+            item["registerable"] = True
+        except DevctlError as exc:
+            item["registerable"] = False
+            item["reason"] = str(exc)
+            workspace = None
+        record = registered_record_for_path(config, path)
+        item["registeredAs"] = record.get("id") if record else None
+        if args.register and workspace is not None and item["registerable"] and record is None:
+            try:
+                register_workspace_record(config, workspace, item["id"], item["name"])
+                item["registeredAs"] = item["id"]
+                item["registeredNow"] = True
+                changed = True
+            except DevctlError as exc:
+                item["reason"] = str(exc)
+        items.append(item)
+    if changed:
+        save_global_config(config)
+    payload = {"ok": True, "roots": [str(root) for root in roots], "depth": args.depth, "workspaces": items,
+               "configPath": str(devctl_global_config_path())}
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    print_header("devctl workspace scan")
+    if not items:
+        print("Workspace не найдены.")
+    for item in items:
+        if item.get("registeredNow"):
+            mark = f"зарегистрирован сейчас как {item['registeredAs']}"
+        elif item.get("registeredAs"):
+            mark = f"уже в реестре как {item['registeredAs']}"
+        elif item.get("registerable"):
+            mark = "можно зарегистрировать" + ("" if args.register else " (--register)")
+        else:
+            mark = "не регистрируется"
+        print(f"{item['path']}\n    id: {item.get('id') or '-'}; {mark}")
+        if item.get("reason"):
+            print(f"    причина: {item['reason']}")
+    return 0
+
+
+def workspace_list_command(args: argparse.Namespace) -> int:
+    config = load_global_config()
+    records = [record for record in config.get("workspaces", []) if isinstance(record, dict)]
+    items = [workspace_agent_info(record) for record in records]
+    if args.json:
+        print(json.dumps({"ok": True, "version": DEVCTL_VERSION, "workspaces": items}, ensure_ascii=False))
+        return 0
+    if args.for_agent:
+        print(render_workspaces_for_agent(items), end="")
+        return 0
+    print_header("devctl workspace list")
+    if not items:
+        print("Реестр пуст. Найдите workspace: `devctl workspace scan --register`.")
+    for item in items:
+        state = "недоступен" if not item.get("available") else f"{item.get('branch') or '-'} @ {str(item.get('head') or '-')[:12]}"
+        print(f"{item.get('id'):<24} {state:<28} {item.get('path')}")
+    return 0
+
+
 def workspace_command(args: argparse.Namespace) -> int:
     action = getattr(args, "workspace_action", None)
+    if action == "scan":
+        return workspace_scan_command(args)
+    if action == "list":
+        return workspace_list_command(args)
     if action != "register":
-        raise DevctlError("Поддерживается только `devctl workspace register`")
+        raise DevctlError("Неизвестная команда workspace. Используйте register/scan/list.")
     workspace = discover_workspace_from_override(args.path)
     validate_workspace_registerable(workspace)
     config = load_global_config()
@@ -1248,10 +1472,14 @@ def append_run_state(workspace: Workspace, run: dict[str, Any]) -> None:
 
 
 def find_state_run(state: dict[str, Any], patch_sha256: str | None, patch_id: str | None = None) -> dict[str, Any] | None:
+    """Последний успешный запуск патча; запись `reverted` (откат пачки) отменяет более ранние."""
     for run in reversed(state.get("runs", [])):
-        if patch_sha256 and run.get("patchSha256") == patch_sha256 and run.get("status") == "applied":
-            return run
-        if patch_id and run.get("patchId") == patch_id and run.get("status") == "applied":
+        matches = (patch_sha256 and run.get("patchSha256") == patch_sha256) or (patch_id and run.get("patchId") == patch_id)
+        if not matches:
+            continue
+        if run.get("status") == "reverted":
+            return None
+        if run.get("status") == "applied":
             return run
     return None
 
@@ -1364,18 +1592,82 @@ def list_patch_candidates(workspace: Workspace) -> list[PatchCandidate]:
     return candidates
 
 
+def manifest_base(manifest: dict[str, Any] | None) -> dict[str, Any]:
+    if isinstance(manifest, dict) and isinstance(manifest.get("base"), dict):
+        return manifest["base"]
+    return {}
+
+
+def manifest_after_ids(manifest: dict[str, Any] | None) -> list[str]:
+    """patchId, после которых патч должен применяться (`base.after`: строка или список)."""
+    raw = manifest_base(manifest).get("after")
+    values = [raw] if isinstance(raw, str) else raw if isinstance(raw, list) else []
+    return unique_strings(str(item).strip() for item in values if isinstance(item, str) and item.strip())
+
+
+def patch_id_applied(workspace: Workspace, state: dict[str, Any], patch_id: str) -> bool:
+    if find_state_run(state, None, patch_id):
+        return True
+    return patch_seen_in_git(workspace.project_root, None, patch_id, limit=1000)
+
+
+def candidate_applied(workspace: Workspace, state: dict[str, Any], candidate: PatchCandidate) -> bool:
+    if not candidate.sha256:
+        return False
+    if find_state_run(state, candidate.sha256, candidate.patch_id):
+        return True
+    return patch_seen_in_git(workspace.project_root, candidate.sha256, candidate.patch_id)
+
+
 def find_latest_unapplied_patch(
     workspace: Workspace,
     state: dict[str, Any],
     candidates: list[PatchCandidate],
 ) -> PatchCandidate | None:
-    for candidate in candidates:
-        if candidate.sha256 and find_state_run(state, candidate.sha256, candidate.patch_id):
-            continue
-        if candidate.sha256 and patch_seen_in_git(workspace.project_root, candidate.sha256, candidate.patch_id):
-            continue
-        return candidate
-    return None
+    """Выбрать следующий патч.
+
+    Как и раньше, основа — самый свежий неприменённый zip. Если он объявляет
+    `base.after`, а нужный патч ещё не применён и лежит в той же очереди,
+    сначала идёт он: так несколько патчей, подготовленных параллельно, можно
+    положить в patches/ разом.
+    """
+    unapplied = [candidate for candidate in candidates if not candidate_applied(workspace, state, candidate)]
+    if not unapplied:
+        return None
+    by_id = {candidate.patch_id: candidate for candidate in reversed(unapplied) if candidate.patch_id}
+    selected = unapplied[0]
+    visited: set[str] = set()
+    while True:
+        key = selected.patch_id or selected.path.name
+        if key in visited:
+            return selected
+        visited.add(key)
+        dependency = next(
+            (by_id[dep] for dep in manifest_after_ids(selected.manifest) if dep in by_id and dep not in visited),
+            None,
+        )
+        if dependency is None:
+            return selected
+        selected = dependency
+
+
+def validate_patch_base(workspace: Workspace, state: dict[str, Any], manifest: dict[str, Any]) -> None:
+    """`base.expectedHead` и `base.after`: патч собран против конкретного состояния проекта."""
+    base = manifest_base(manifest)
+    expected = base.get("expectedHead")
+    if isinstance(expected, str) and expected.strip():
+        expected = expected.strip().lower()
+        if len(expected) < 7:
+            raise InvalidPatchError("manifest.base.expectedHead должен содержать не меньше 7 символов SHA")
+        head = git_head(workspace.project_root).lower()
+        if not head.startswith(expected):
+            raise PreflightError(
+                f"Патч собран против {expected[:12]}, а HEAD проекта — {head[:12]}. "
+                "Нужен патч, пересобранный на текущее состояние, или откат к его базе."
+            )
+    missing = [dep for dep in manifest_after_ids(manifest) if not patch_id_applied(workspace, state, dep)]
+    if missing:
+        raise PreflightError("Патч ожидает, что сначала будут применены: " + ", ".join(missing))
 
 
 # ---------------------------------------------------------------------------
@@ -1479,6 +1771,17 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
     push = manifest.get("push", {"enabled": True})
     if not isinstance(push, dict):
         raise InvalidPatchError("manifest.push должен быть объектом")
+    base = manifest.get("base", {})
+    if not isinstance(base, dict):
+        raise InvalidPatchError("manifest.base должен быть объектом")
+    for key in ("branch", "expectedHead"):
+        if key in base and base.get(key) is not None and not isinstance(base.get(key), str):
+            raise InvalidPatchError(f"manifest.base.{key} должен быть строкой")
+    after = base.get("after")
+    if after is not None and not isinstance(after, str) and not (
+        isinstance(after, list) and all(isinstance(item, str) and item.strip() for item in after)
+    ):
+        raise InvalidPatchError("manifest.base.after должен быть строкой или списком patchId")
     for section in ("setup", "services"):
         if section in manifest and not isinstance(manifest.get(section), list):
             raise InvalidPatchError(f"manifest.{section} зарезервирован и должен быть списком")
@@ -1808,7 +2111,7 @@ def patch_seen_in_git(project_root: Path, patch_sha256: str | None, patch_id: st
     return False
 
 
-def build_commit_message(manifest: dict[str, Any], patch_sha256: str) -> str:
+def build_commit_message(manifest: dict[str, Any], patch_sha256: str, batch_id: str | None = None) -> str:
     commit = manifest.get("commit") if isinstance(manifest.get("commit"), dict) else {}
     message = str(commit.get("message") or f"chore: применить патч {manifest.get('patchId')}").strip()
     trailers = [
@@ -1816,6 +2119,8 @@ def build_commit_message(manifest: dict[str, Any], patch_sha256: str) -> str:
         f"Patch-SHA256: {patch_sha256}",
         f"Devctl-Version: {DEVCTL_VERSION}",
     ]
+    if batch_id:
+        trailers.append(f"Devctl-Batch: {batch_id}")
     return message.rstrip() + "\n\n" + "\n".join(trailers) + "\n"
 
 
@@ -1824,7 +2129,22 @@ def build_commit_message(manifest: dict[str, Any], patch_sha256: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def validate_check_prerequisites(project_root: Path, manifest: dict[str, Any]) -> None:
+def patch_creates_directory(payload_paths: Iterable[str], directory: str) -> bool:
+    prefix = directory.rstrip("/") + "/"
+    return any(path.startswith(prefix) for path in payload_paths)
+
+
+def validate_check_prerequisites(
+    project_root: Path,
+    manifest: dict[str, Any],
+    payload_paths: Iterable[str] | None = None,
+) -> None:
+    """Проверить команды и рабочие каталоги проверок до наложения патча.
+
+    Каталог проверки может ещё не существовать, если его создаёт сам патч
+    (в `files/` есть файлы внутри него): тогда он проверяется уже при запуске.
+    """
+    payload = list(payload_paths or [])
     checks = manifest.get("checks", [])
     if not isinstance(checks, list):
         raise InvalidPatchError("manifest.checks должен быть списком")
@@ -1836,14 +2156,16 @@ def validate_check_prerequisites(project_root: Path, manifest: dict[str, Any]) -
         check_name = str(check.get("name", index))
         cwd_raw = validate_relative_posix_path(check.get("cwd", "."), allow_dot=True, kind=f"checks[{index}].cwd")
         cwd = project_root if cwd_raw == "." else safe_destination(project_root, cwd_raw, kind=f"checks[{index}].cwd")
-        if not cwd.is_dir():
+        if not cwd.is_dir() and not (cwd_raw != "." and patch_creates_directory(payload, cwd_raw)):
             bad_cwds.append(f"{check_name}: {cwd_raw}")
         for command in check.get("requiredCommands", []):
             command_name = command.strip()
             if not shutil.which(command_name):
                 missing.append(f"{command_name} (required by {check_name})")
     if bad_cwds:
-        raise PreflightError("Рабочий каталог проверки не существует до применения патча: " + ", ".join(bad_cwds))
+        raise PreflightError(
+            "Рабочий каталог проверки не существует и патч его не создаёт: " + ", ".join(bad_cwds)
+        )
     if missing:
         unique = sorted(set(missing))
         raise PreflightError("Отсутствуют обязательные команды: " + ", ".join(unique))
@@ -1924,9 +2246,9 @@ def should_exclude_from_archive(relative_posix: str, extra_excludes: Iterable[st
         return False
     name = Path(normalized_rel).name
     parts = set(part for part in normalized_rel.split("/") if part)
-    if ".env.example" == name:
+    if name in ENV_TEMPLATE_NAMES:
         return False
-    if name == ".env" or name.startswith(".env."):
+    if is_secret_env_name(name):
         return True
     if parts & ARCHIVE_EXCLUDED_PARTS:
         return True
@@ -2299,13 +2621,31 @@ def safe_copy_files(ctx: RunContext) -> None:
             if is_python_bytecode_artifact(rel):
                 ctx.ignored_bytecode_files.append(rel)
                 continue
-            if parts[-1] == ".env" or parts[-1].startswith(".env."):
+            if is_secret_env_name(parts[-1]):
                 raise InvalidPatchError(f"Отказ копировать env-файл, похожий на секрет: {rel}")
             destination = safe_destination(project_root, rel, kind=f"zip entry {name!r}")
             destination.parent.mkdir(parents=True, exist_ok=True)
             with zf.open(info, "r") as source, destination.open("wb") as target:
                 shutil.copyfileobj(source, target)
             ctx.copied_files.append(rel)
+
+
+def warn_ignored_env_templates(ctx: RunContext) -> None:
+    """Шаблон `.env.example` скопирован, но `.gitignore` его скроет от коммита."""
+    templates = [rel for rel in ctx.copied_files if rel.split("/")[-1] in ENV_TEMPLATE_NAMES]
+    for rel in templates:
+        result = git(ctx.workspace.project_root, ["check-ignore", "-q", "--", rel], timeout=30)
+        if result.returncode == 0:
+            ctx.warnings.append(
+                f"{rel} скопирован, но игнорируется .gitignore и не попадёт в коммит; "
+                f"добавьте в .gitignore исключение !{rel.split('/')[-1]}"
+            )
+
+
+def patch_payload_paths(candidate: PatchCandidate, manifest: dict[str, Any]) -> list[str]:
+    files_root = manifest.get("apply", {}).get("filesRoot", "files") if isinstance(manifest.get("apply"), dict) else "files"
+    prefix = str(files_root).rstrip("/") + "/"
+    return [name[len(prefix):] for name in zip_files_under_root(candidate.path, str(files_root))]
 
 
 # ---------------------------------------------------------------------------
@@ -2335,7 +2675,13 @@ def run_checks(ctx: RunContext) -> None:
         timeout = int(check.get("timeoutSeconds", 300))
         log_path = log_path_for_check(ctx.logs_dir or ctx.workspace.archives_dir, index, name)
         start = time.monotonic()
-        result = run_command(command, cwd, timeout=timeout, shell=True)
+        if cwd.is_dir():
+            result = run_command(command, cwd, timeout=timeout, shell=True)
+        else:
+            result = CommandResult(
+                args=command, cwd=cwd, returncode=127, stdout="",
+                stderr=f"Рабочий каталог проверки не появился после наложения патча: {cwd_raw}",
+            )
         duration = time.monotonic() - start
         log_text = []
         log_text.append(f"# Проверка: {name}\n")
@@ -2387,8 +2733,7 @@ def is_dangerous_git_path(relative_posix: str) -> bool:
     name = normalized.split("/")[-1]
     lower = normalized.lower()
     return (
-        name == ".env"
-        or name.startswith(".env.")
+        is_secret_env_name(name)
         or bool(parts & DANGEROUS_GIT_PATH_PARTS)
         or lower.endswith(DANGEROUS_GIT_PATH_SUFFIXES)
     )
@@ -2461,7 +2806,7 @@ def commit_and_push(ctx: RunContext) -> None:
     if add_result.returncode != 0:
         raise DevctlError(f"git add -A завершился ошибкой: {add_result.stderr.strip() or add_result.stdout.strip()}")
 
-    message = build_commit_message(ctx.manifest, ctx.patch.sha256 or "")
+    message = build_commit_message(ctx.manifest, ctx.patch.sha256 or "", ctx.batch_id)
     # subprocess.run is used directly here because git commit reads the message from stdin.
     completed = subprocess.run(
         ["git", "commit", "-F", "-"],
@@ -2676,6 +3021,8 @@ def update_state_from_context(ctx: RunContext) -> None:
         "cleanedBytecodePaths": sorted(set(ctx.cleaned_bytecode_paths)),
         "bytecodeCleanupError": ctx.bytecode_cleanup_error,
     }
+    if ctx.batch_id:
+        record["batchId"] = ctx.batch_id
     append_run_state(ctx.workspace, record)
 
 
@@ -3091,7 +3438,31 @@ def emit_start_json_result(args: argparse.Namespace, ctx: RunContext | None, *, 
 # ---------------------------------------------------------------------------
 
 
-def prepare_context(workspace: Workspace, state: dict[str, Any]) -> RunContext | None:
+def candidate_for_patch_arg(workspace: Workspace, raw: str) -> PatchCandidate:
+    """Конкретный патч для `start --patch`: только из patches/ этого workspace."""
+    path = expand_user_path(raw)
+    if not path.is_absolute():
+        path = workspace.patches_dir / path
+    path = path.resolve()
+    try:
+        path.relative_to(workspace.patches_dir.resolve())
+    except ValueError as exc:
+        raise DevctlError(f"--patch должен указывать на zip внутри {workspace.patches_dir}: {path}") from exc
+    if not path.is_file():
+        raise DevctlError(f"Патч не найден: {path}")
+    manifest, error = read_manifest_from_zip(path)
+    candidate = PatchCandidate(path=path, manifest=manifest, manifest_error=error, sort_key=candidate_sort_key(path, manifest))
+    candidate.sha256 = sha256_file(path)
+    return candidate
+
+
+def prepare_context(workspace: Workspace, state: dict[str, Any], patch_arg: str | None = None) -> RunContext | None:
+    if patch_arg:
+        patch = candidate_for_patch_arg(workspace, patch_arg)
+        if candidate_applied(workspace, state, patch):
+            print(f"Патч уже применён: {patch.path.name}. Делать нечего.")
+            return None
+        return context_for_patch(workspace, patch)
     candidates = list_patch_candidates(workspace)
     if not candidates:
         print("Zip-файлы патчей не найдены. Делать нечего.")
@@ -3106,6 +3477,10 @@ def prepare_context(workspace: Workspace, state: dict[str, Any]) -> RunContext |
         else:
             print(f"Последний патч уже виден в недавней истории Git: {latest.path.name}")
         return None
+    return context_for_patch(workspace, patch)
+
+
+def context_for_patch(workspace: Workspace, patch: PatchCandidate) -> RunContext:
     manifest = patch.manifest
     if patch.manifest_error or manifest is None:
         # Minimal context with synthetic manifest for diagnostic report.
@@ -3138,13 +3513,14 @@ def start_command(args: argparse.Namespace) -> int:
         workspace = discover_workspace(workspace_arg_from_namespace(args))
         validate_workspace_for_start(workspace)
         state = load_state(workspace)
-        ctx = prepare_context(workspace, state)
+        ctx = prepare_context(workspace, state, getattr(args, "patch", None))
         if ctx is None:
             emit_start_json_result(args, None, status="noop", message="Неприменённых патчей не найдено или каталог patches пуст.", returncode=0)
             return 0
         if ctx.status != "running":
             emit_start_json_result(args, ctx, returncode=2)
             return 2
+        ctx.batch_id = getattr(args, "batch_id", None)
 
         try:
             validate_manifest(ctx.manifest)
@@ -3152,7 +3528,8 @@ def start_command(args: argparse.Namespace) -> int:
 
             # Git/environment prerequisites are deliberately checked before creating a pre archive or applying patch.
             validate_git_preflight(workspace, ctx.manifest, ctx, no_push=args.no_push)
-            validate_check_prerequisites(workspace.project_root, ctx.manifest)
+            validate_patch_base(workspace, state, ctx.manifest)
+            validate_check_prerequisites(workspace.project_root, ctx.manifest, patch_payload_paths(ctx.patch, ctx.manifest))
 
             ctx.run_dir = create_run_dir(workspace, ctx.manifest, ctx.patch.sha256)
             ctx.logs_dir = ctx.run_dir / "logs"
@@ -3176,6 +3553,7 @@ def start_command(args: argparse.Namespace) -> int:
             ctx.applied_started = True
             apply_deletions(ctx)
             safe_copy_files(ctx)
+            warn_ignored_env_templates(ctx)
             clean_python_bytecode_for_start(ctx, "apply")
             ctx.git_status_after_apply = git_status_porcelain(workspace.project_root)
             write_log(ctx, "git-status-after-apply.log", ctx.git_status_after_apply)
@@ -7483,6 +7861,619 @@ def complete_command(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Batch: пачка патчей для одного или нескольких workspace этой машины
+# ---------------------------------------------------------------------------
+
+BATCH_FORMAT_VERSION = 1
+BATCH_MANIFEST_NAME = "batch.json"
+BATCH_PUSH_MODES = ("after-all", "each", "none")
+
+
+def devctl_batch_index_path() -> Path:
+    return devctl_config_dir() / "batch_index.json"
+
+
+def load_batch_index() -> dict[str, Any]:
+    path = devctl_batch_index_path()
+    if not path.exists():
+        return {"version": 1, "batches": []}
+    data = read_json_file(path)
+    if not isinstance(data.get("batches"), list):
+        data["batches"] = []
+    return data
+
+
+def save_batch_record(record: dict[str, Any]) -> None:
+    index = load_batch_index()
+    batches = [item for item in index["batches"] if isinstance(item, dict) and item.get("runId") != record.get("runId")]
+    batches.append(record)
+    index["batches"] = batches
+    write_json_file(devctl_batch_index_path(), index)
+
+
+def version_tuple(value: str) -> tuple[int, ...]:
+    numbers = re.findall(r"\d+", value)
+    if not numbers:
+        raise DevctlError(f"Не удалось разобрать версию: {value!r}")
+    return tuple(int(item) for item in numbers[:3]) + (0,) * (3 - min(len(numbers), 3))
+
+
+def devctl_satisfies(spec: str) -> bool:
+    """`requiresDevctl`: ">=0.9.0", ">0.9", "==0.9.0" или просто "0.9.0" (то же, что >=)."""
+    text = spec.strip()
+    match = re.match(r"^(>=|>|==)?\s*(.+)$", text)
+    if not match:
+        raise DevctlError(f"Не удалось разобрать requiresDevctl: {spec!r}")
+    op, version = match.group(1) or ">=", match.group(2)
+    have, need = version_tuple(DEVCTL_VERSION), version_tuple(version)
+    return {">=": have >= need, ">": have > need, "==": have == need}[op]
+
+
+def zip_has_batch_manifest(path: Path) -> bool:
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            return BATCH_MANIFEST_NAME in zf.namelist()
+    except Exception:
+        return False
+
+
+def read_batch(path: Path) -> dict[str, Any]:
+    """Прочитать и проверить batch.json; вернуть его с нормализованными items."""
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            names = set(zf.namelist())
+            if BATCH_MANIFEST_NAME not in names:
+                raise InvalidPatchError(f"В пачке нет {BATCH_MANIFEST_NAME}: {path.name}")
+            data = json.loads(safe_decode(zf.read(BATCH_MANIFEST_NAME)))
+    except zipfile.BadZipFile as exc:
+        raise InvalidPatchError(f"Пачка не является zip-файлом: {path}") from exc
+    if not isinstance(data, dict):
+        raise InvalidPatchError("Корень batch.json должен быть объектом")
+    if data.get("formatVersion") != BATCH_FORMAT_VERSION:
+        raise InvalidPatchError(f"batch.formatVersion должен быть равен {BATCH_FORMAT_VERSION}")
+    batch_id = data.get("batchId")
+    if not isinstance(batch_id, str) or not batch_id.strip():
+        raise InvalidPatchError("batch.batchId должен быть непустой строкой")
+    requires = data.get("requiresDevctl")
+    if requires is not None:
+        if not isinstance(requires, str) or not requires.strip():
+            raise InvalidPatchError("batch.requiresDevctl должен быть строкой вроде \">=0.9.0\"")
+        if not devctl_satisfies(requires):
+            raise PreflightError(
+                f"Пачка требует devctl {requires}, установлен {DEVCTL_VERSION}. Обновите devctl (`devctl self update`)."
+            )
+    push = data.get("push", "after-all")
+    if push not in BATCH_PUSH_MODES:
+        raise InvalidPatchError("batch.push должен быть одним из: " + ", ".join(BATCH_PUSH_MODES))
+    items = data.get("items")
+    if not isinstance(items, list) or not items:
+        raise InvalidPatchError("batch.items должен быть непустым списком")
+    normalized: list[dict[str, Any]] = []
+    basenames: set[str] = set()
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise InvalidPatchError(f"batch.items[{index}] должен быть объектом")
+        member = validate_relative_posix_path(item.get("patch"), kind=f"batch.items[{index}].patch")
+        if not member.lower().endswith(".zip") or member not in names:
+            raise InvalidPatchError(f"batch.items[{index}].patch не найден в пачке как zip: {member}")
+        basename = member.split("/")[-1]
+        if basename in basenames:
+            raise InvalidPatchError(f"Два патча пачки называются одинаково: {basename}")
+        basenames.add(basename)
+        workspace_id = item.get("workspace")
+        if not isinstance(workspace_id, str) or not workspace_id.strip():
+            raise InvalidPatchError(f"batch.items[{index}].workspace должен быть id workspace из реестра")
+        expected = item.get("expectedHead")
+        if expected is not None and (not isinstance(expected, str) or len(expected.strip()) < 7):
+            raise InvalidPatchError(f"batch.items[{index}].expectedHead должен быть SHA не короче 7 символов")
+        normalized.append(
+            {"index": index, "patch": member, "file": basename, "workspace": workspace_id.strip(),
+             "expectedHead": expected.strip().lower() if isinstance(expected, str) else None}
+        )
+    data["push"] = push
+    data["items"] = normalized
+    return data
+
+
+def find_batch_source(raw: str | None) -> Path:
+    if raw:
+        path = expand_user_path(raw).resolve()
+        if not path.is_file():
+            raise DevctlError(f"Пачка не найдена: {path}")
+        return path
+    config = load_global_config()
+    found: list[Path] = []
+    for source in inbox_scan_sources(config):
+        directory = source["source"]
+        if directory.is_dir():
+            found.extend(path for path in directory.glob("*.zip") if zip_has_batch_manifest(path))
+    if not found:
+        raise DevctlError("Пачка не указана, и в складе (devctl inbox) нет batch_*.zip. Передайте путь: `devctl batch plan <файл>`.")
+    found.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return found[0]
+
+
+def candidate_from_bytes(directory: Path, name: str, data: bytes) -> PatchCandidate:
+    path = directory / name
+    path.write_bytes(data)
+    manifest, error = read_manifest_from_zip(path)
+    return PatchCandidate(path=path, sha256=hashlib.sha256(data).hexdigest(), manifest=manifest,
+                          manifest_error=error, sort_key=candidate_sort_key(path, manifest))
+
+
+def batch_remote_preflight(workspace: Workspace, manifest: dict[str, Any], batch_id: str) -> None:
+    """Remote не ушёл вперёд; локально впереди могут быть только коммиты этой же пачки (повторный запуск)."""
+    project = workspace.project_root
+    enabled, remote, branch, _note = effective_push_policy(workspace, manifest, no_push=False, current_branch=git_branch(project))
+    if not enabled:
+        return
+    fetch_remote(project, remote)
+    if not remote_ref_exists(project, remote, branch):
+        return
+    ahead, behind, error = ahead_behind(project, remote, branch)
+    if error:
+        raise PreflightError(error)
+    if behind:
+        raise PreflightError(f"Локальная ветка отстаёт от {remote}/{branch} на {behind} коммит(ов). Сначала синхронизируйте.")
+    if ahead:
+        log = git(project, ["log", f"{remote}/{branch}..HEAD", "--format=%B%x1e"])
+        messages = [chunk for chunk in log.stdout.split("\x1e") if chunk.strip()]
+        foreign = [chunk for chunk in messages if f"Devctl-Batch: {batch_id}" not in chunk]
+        if foreign:
+            raise PreflightError(
+                f"Локальная ветка опережает {remote}/{branch} на {ahead} коммит(ов), и не все они из этой пачки. "
+                "Отправьте или уберите их перед пачкой."
+            )
+
+
+def build_batch_plan(batch_path: Path, *, fetch: bool = True) -> dict[str, Any]:
+    """Проверить пачку целиком, ничего не меняя в workspace.
+
+    Возвращает шаги и список проблем. Пустой список проблем = пачку можно
+    начинать. Временные копии патчей лежат в каталоге plan["tmpDir"]; его
+    удаляет вызывающий.
+    """
+    import tempfile
+
+    batch = read_batch(batch_path)
+    config = load_global_config()
+    tmp_dir = Path(tempfile.mkdtemp(prefix="devctl-batch-"))
+    problems: list[str] = []
+    warnings: list[str] = []
+    steps: list[dict[str, Any]] = []
+    workspaces: dict[str, dict[str, Any]] = {}
+    with zipfile.ZipFile(batch_path, "r") as zf:
+        for item in batch["items"]:
+            step: dict[str, Any] = {**item, "problems": []}
+            steps.append(step)
+            candidate = candidate_from_bytes(tmp_dir, item["file"], zf.read(item["patch"]))
+            step["tmpPath"] = str(candidate.path)
+            step["sha256"] = candidate.sha256
+            step["patchId"] = candidate.patch_id
+            step["title"] = candidate.title
+            if candidate.manifest_error or candidate.manifest is None:
+                step["problems"].append(f"manifest: {candidate.manifest_error}")
+                continue
+            try:
+                validate_manifest(candidate.manifest)
+                validate_patch_files_root(candidate, candidate.manifest)
+            except InvalidPatchError as exc:
+                step["problems"].append(str(exc))
+                continue
+
+            record = registered_workspace_by_id(config, item["workspace"])
+            if record is None:
+                step["problems"].append(
+                    f"workspace {item['workspace']!r} нет в реестре этой машины (`devctl workspace scan --register`)"
+                )
+                continue
+            workspace, error = workspace_record_project(record)
+            if workspace is None:
+                step["problems"].append(f"workspace {item['workspace']!r} недоступен: {error}")
+                continue
+            step["workspacePath"] = record.get("path")
+            ws = workspaces.get(item["workspace"])
+            if ws is None:
+                ws = {"workspace": workspace, "path": record.get("path"), "patchIds": set(), "payload": [],
+                      "firstPending": True, "state": load_state(workspace), "items": []}
+                workspaces[item["workspace"]] = ws
+            ws["items"].append(item["index"])
+            state = ws["state"]
+
+            if candidate_applied(workspace, state, candidate):
+                step["status"] = "already_applied"
+                if candidate.patch_id:
+                    ws["patchIds"].add(candidate.patch_id)
+                continue
+            step["status"] = "pending"
+
+            destination = workspace.patches_dir / item["file"]
+            if destination.exists() and sha256_file(destination) != candidate.sha256:
+                step["problems"].append(f"в patches/ уже лежит другой файл с именем {item['file']}")
+
+            if ws["firstPending"]:
+                ws["firstPending"] = False
+                try:
+                    validate_git_preflight(workspace, candidate.manifest, None, no_push=True)
+                    if batch["push"] != "none" and fetch:
+                        batch_remote_preflight(workspace, candidate.manifest, batch["batchId"])
+                    head = git_head(workspace.project_root)
+                    ws["headBefore"] = head
+                    step["head"] = head
+                except DevctlError as exc:
+                    step["problems"].append(str(exc))
+                    continue
+                expected = item.get("expectedHead") or (manifest_base(candidate.manifest).get("expectedHead") or "").strip().lower()
+                if expected and not ws["headBefore"].lower().startswith(expected):
+                    step["problems"].append(
+                        f"пачка собрана против {expected[:12]}, а HEAD — {ws['headBefore'][:12]}"
+                    )
+                if not expected:
+                    warnings.append(f"{item['file']}: не указан expectedHead; база не сверяется")
+            else:
+                if item.get("expectedHead") or manifest_base(candidate.manifest).get("expectedHead"):
+                    step["problems"].append(
+                        "expectedHead допустим только у первого патча workspace в пачке: HEAD для следующих "
+                        "появится после применения предыдущих"
+                    )
+            missing = [
+                dep for dep in manifest_after_ids(candidate.manifest)
+                if dep not in ws["patchIds"] and not patch_id_applied(workspace, state, dep)
+            ]
+            if missing:
+                step["problems"].append("base.after не выполнен ни историей, ни пачкой выше: " + ", ".join(missing))
+            branch = manifest_base(candidate.manifest).get("branch")
+            if isinstance(branch, str) and branch and (workspace.project_root / ".git").exists():
+                try:
+                    current = git_branch(workspace.project_root)
+                    if current != branch:
+                        step["problems"].append(f"патч ожидает ветку {branch!r}, текущая — {current!r}")
+                except DevctlError as exc:
+                    step["problems"].append(str(exc))
+            payload = patch_payload_paths(candidate, candidate.manifest)
+            try:
+                validate_check_prerequisites(workspace.project_root, candidate.manifest, [*ws["payload"], *payload])
+            except DevctlError as exc:
+                step["problems"].append(str(exc))
+            ws["payload"].extend(payload)
+            if candidate.patch_id:
+                ws["patchIds"].add(candidate.patch_id)
+
+    for step in steps:
+        for problem in step["problems"]:
+            problems.append(f"[{step['index'] + 1}] {step['file']}: {problem}")
+    return {
+        "batch": batch,
+        "batchPath": str(batch_path),
+        "batchSha256": sha256_file(batch_path),
+        "steps": steps,
+        "workspaces": {
+            key: {"path": value["path"], "headBefore": value.get("headBefore"), "items": value["items"]}
+            for key, value in workspaces.items()
+        },
+        "problems": problems,
+        "warnings": warnings,
+        "tmpDir": str(tmp_dir),
+    }
+
+
+def batch_plan_to_json(plan: dict[str, Any]) -> dict[str, Any]:
+    batch = plan["batch"]
+    return {
+        "ok": not plan["problems"],
+        "version": DEVCTL_VERSION,
+        "batchId": batch.get("batchId"),
+        "title": batch.get("title"),
+        "batchPath": plan["batchPath"],
+        "push": batch.get("push"),
+        "steps": [
+            {key: step.get(key) for key in ("index", "file", "workspace", "workspacePath", "patchId", "title",
+                                            "status", "head", "expectedHead", "sha256", "problems")}
+            for step in plan["steps"]
+        ],
+        "workspaces": plan["workspaces"],
+        "problems": plan["problems"],
+        "warnings": plan["warnings"],
+    }
+
+
+def print_batch_plan(plan: dict[str, Any]) -> None:
+    batch = plan["batch"]
+    print_header(f"devctl batch: {batch.get('batchId')}")
+    if batch.get("title"):
+        print(batch["title"])
+    print(f"Файл:  {plan['batchPath']}")
+    print(f"Push:  {batch.get('push')}")
+    for step in plan["steps"]:
+        status = {"already_applied": "уже применён", "pending": "применить"}.get(step.get("status"), "?")
+        print(f"\n[{step['index'] + 1}] {step['file']} -> {step['workspace']}  ({status})")
+        if step.get("patchId"):
+            print(f"    patchId: {step['patchId']}")
+        if step.get("head"):
+            print(f"    HEAD:    {step['head'][:12]}")
+        for problem in step["problems"]:
+            print(f"    [ПРОБЛЕМА] {problem}")
+    for warning in plan["warnings"]:
+        print(f"\n[ПРЕДУПРЕЖДЕНИЕ] {warning}")
+    print()
+    print("Пачку можно начинать: `devctl batch start`." if not plan["problems"] else "Пачку начинать нельзя: исправьте проблемы выше.")
+
+
+def batch_plan_command(args: argparse.Namespace) -> int:
+    batch_path = find_batch_source(getattr(args, "batch", None))
+    plan = build_batch_plan(batch_path)
+    try:
+        if args.json:
+            print(json.dumps(batch_plan_to_json(plan), ensure_ascii=False))
+        else:
+            print_batch_plan(plan)
+    finally:
+        shutil.rmtree(plan["tmpDir"], ignore_errors=True)
+    return 0 if not plan["problems"] else 2
+
+
+def batch_start_command(args: argparse.Namespace) -> int:
+    batch_path = find_batch_source(getattr(args, "batch", None))
+    plan = build_batch_plan(batch_path)
+    batch = plan["batch"]
+    try:
+        if plan["problems"]:
+            if args.json:
+                print(json.dumps(batch_plan_to_json(plan), ensure_ascii=False))
+            else:
+                print_batch_plan(plan)
+            return 2
+
+        run_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{slugify(batch['batchId'])}"
+        # Повторный запуск после остановки: HEAD «до пачки» берётся из первого незавершённого запуска,
+        # чтобы `batch reset` откатывал пачку целиком, а не только последнюю попытку.
+        previous = [
+            item for item in load_batch_index().get("batches", [])
+            if isinstance(item, dict) and item.get("batchId") == batch["batchId"]
+        ]
+        if previous and previous[-1].get("status") in {"failed", "push_failed", "running"}:
+            for key, info in plan["workspaces"].items():
+                earlier = (previous[-1].get("workspaces") or {}).get(key) or {}
+                if earlier.get("headBefore"):
+                    info["headBefore"] = earlier["headBefore"]
+        record: dict[str, Any] = {
+            "runId": run_id,
+            "batchId": batch["batchId"],
+            "title": batch.get("title"),
+            "batchFile": str(batch_path),
+            "batchSha256": plan["batchSha256"],
+            "push": batch["push"],
+            "devctlVersion": DEVCTL_VERSION,
+            "startedAt": iso_now(),
+            "status": "running",
+            "workspaces": {key: {**value, "pushResult": None} for key, value in plan["workspaces"].items()},
+            "items": [
+                {"index": step["index"], "file": step["file"], "workspace": step["workspace"],
+                 "patchId": step.get("patchId"), "sha256": step.get("sha256"),
+                 "status": "already_applied" if step.get("status") == "already_applied" else "pending",
+                 "commitSha": None}
+                for step in plan["steps"]
+            ],
+        }
+        save_batch_record(record)
+        config = load_global_config()
+
+        # 1. Раскладка: каждый патч в patches/ своего workspace.
+        for step in plan["steps"]:
+            if step.get("status") != "pending":
+                continue
+            workspace, _ = workspace_record_project(registered_workspace_by_id(config, step["workspace"]) or {})
+            assert workspace is not None
+            workspace.patches_dir.mkdir(parents=True, exist_ok=True)
+            destination = workspace.patches_dir / step["file"]
+            if not destination.exists():
+                shutil.copy2(step["tmpPath"], destination)
+            if sha256_file(destination) != step["sha256"]:
+                raise DevctlError(f"SHA-256 разложенного патча не совпал: {destination}")
+
+        # 2. Применение по порядку обычным start.
+        failed_item: dict[str, Any] | None = None
+        for step, item in zip(plan["steps"], record["items"]):
+            if item["status"] != "pending":
+                continue
+            workspace_path = record["workspaces"][step["workspace"]]["path"]
+            print_header(f"batch [{step['index'] + 1}/{len(plan['steps'])}] {step['file']} -> {step['workspace']}")
+            start_args = argparse.Namespace(
+                workspace_override=workspace_path, no_push=(batch["push"] != "each"), keep_failed_patch=False,
+                json=False, patch=step["file"], batch_id=batch["batchId"],
+            )
+            returncode = start_command(start_args)
+            workspace = discover_workspace_from_override(workspace_path)
+            state_run = find_state_run(load_state(workspace), step["sha256"], None)
+            if returncode != 0 or state_run is None:
+                item["status"] = "failed"
+                failed_item = item
+                record["status"] = "failed"
+                record["failedAt"] = item["index"]
+                break
+            item["status"] = "applied"
+            item["commitSha"] = state_run.get("commitSha")
+            item["report"] = state_run.get("report")
+            save_batch_record(record)
+
+        # 3. Push в конце: только когда прошло всё.
+        if failed_item is None:
+            record["status"] = "applied"
+            if batch["push"] == "after-all":
+                for key, info in record["workspaces"].items():
+                    if not any(item["status"] == "applied" and item["workspace"] == key for item in record["items"]):
+                        continue
+                    workspace = discover_workspace_from_override(info["path"])
+                    last_manifest: dict[str, Any] = {}
+                    for step in plan["steps"]:
+                        if step["workspace"] == key:
+                            last_manifest, _ = read_manifest_from_zip(Path(step["tmpPath"]))
+                            last_manifest = last_manifest or {}
+                    enabled, remote, branch, note = effective_push_policy(
+                        workspace, last_manifest, no_push=False, current_branch=git_branch(workspace.project_root)
+                    )
+                    if not enabled:
+                        info["pushResult"] = "пропущено: " + note
+                        continue
+                    result = git(workspace.project_root, ["push", remote, f"HEAD:{branch}"], timeout=240)
+                    if result.returncode != 0:
+                        info["pushResult"] = "ошибка: " + (result.stderr.strip() or result.stdout.strip())
+                        record["status"] = "push_failed"
+                    else:
+                        info["pushResult"] = "push выполнен"
+                        info["pushed"] = True
+            elif batch["push"] == "each":
+                for info in record["workspaces"].values():
+                    info["pushResult"] = "push после каждого патча (push: each)"
+                    info["pushed"] = True
+            else:
+                for info in record["workspaces"].values():
+                    info["pushResult"] = "пропущено: push: none"
+        else:
+            for info in record["workspaces"].values():
+                info["pushResult"] = "не выполнялся: пачка остановлена"
+
+        record["finishedAt"] = iso_now()
+        if record["status"] == "applied":
+            moved = move_batch_from_inbox(batch_path)
+            if moved:
+                record["batchFileMovedTo"] = str(moved)
+        save_batch_record(record)
+        payload = {"ok": record["status"] == "applied", "version": DEVCTL_VERSION, "batch": record}
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False))
+        else:
+            print_batch_record(record)
+        return 0 if record["status"] == "applied" else 1
+    finally:
+        shutil.rmtree(plan["tmpDir"], ignore_errors=True)
+
+
+def move_batch_from_inbox(batch_path: Path) -> Path | None:
+    config = load_global_config()
+    for source in inbox_scan_sources(config):
+        try:
+            batch_path.resolve().relative_to(source["source"].resolve())
+        except ValueError:
+            continue
+        return move_inbox_original(batch_path, source["primary"], "imported")
+    return None
+
+
+def print_batch_record(record: dict[str, Any]) -> None:
+    labels = {
+        "applied": "применена", "failed": "остановлена на ошибке", "push_failed": "применена, push не прошёл",
+        "running": "не завершена", "reverted": "откатана",
+    }
+    print_header(f"devctl batch {record.get('batchId')}: {labels.get(record.get('status'), record.get('status'))}")
+    print(f"Запуск:  {record.get('runId')}  ({record.get('startedAt')} → {record.get('finishedAt') or '…'})")
+    for item in record.get("items", []):
+        commit = f" {str(item.get('commitSha'))[:12]}" if item.get("commitSha") else ""
+        print(f"  [{item['index'] + 1}] {item['status']:<16} {item['workspace']:<20} {item['file']}{commit}")
+    for key, info in record.get("workspaces", {}).items():
+        print(f"  {key}: HEAD до пачки {str(info.get('headBefore') or '-')[:12]}; push: {info.get('pushResult') or '-'}")
+    if record.get("status") == "failed":
+        print("\nУже применённые патчи закоммичены локально и не отправлены.")
+        print("Дальше: исправить и повторить `devctl batch start <пачка>` (применённые пропустятся)")
+        print("или откатить пачку целиком: `devctl batch reset --yes`.")
+
+
+def select_batch_record(batch_id: str | None) -> dict[str, Any]:
+    batches = [item for item in load_batch_index().get("batches", []) if isinstance(item, dict)]
+    if batch_id:
+        batches = [item for item in batches if item.get("batchId") == batch_id or item.get("runId") == batch_id]
+    if not batches:
+        raise DevctlError("Запусков пачек не найдено." if not batch_id else f"Пачка не найдена: {batch_id}")
+    return batches[-1]
+
+
+def batch_status_command(args: argparse.Namespace) -> int:
+    record = select_batch_record(getattr(args, "batch_id", None))
+    if args.json:
+        print(json.dumps({"ok": True, "version": DEVCTL_VERSION, "batch": record}, ensure_ascii=False))
+    else:
+        print_batch_record(record)
+    return 0
+
+
+def batch_reset_command(args: argparse.Namespace) -> int:
+    """Вернуть каждый затронутый workspace к HEAD до пачки, если пачка ещё не отправлена."""
+    record = select_batch_record(getattr(args, "batch_id", None))
+    actions: list[dict[str, Any]] = []
+    blocked: list[str] = []
+    for key, info in record.get("workspaces", {}).items():
+        head_before = info.get("headBefore")
+        if not head_before:
+            continue
+        workspace = discover_workspace_from_override(info["path"])
+        current = git_head(workspace.project_root)
+        if current == head_before:
+            continue
+        commits = git(workspace.project_root, ["rev-list", "--reverse", f"{head_before}..HEAD"]).stdout.split()
+        if not commits:
+            blocked.append(f"{key}: HEAD {current[:12]} не продолжает HEAD до пачки {head_before[:12]}; откатывайте вручную")
+            continue
+        if info.get("pushed") or git(workspace.project_root, ["branch", "-r", "--contains", commits[0]]).stdout.strip():
+            blocked.append(f"{key}: коммиты пачки уже отправлены в remote; откат только новым патчем")
+            continue
+        items = [item for item in record.get("items", []) if item.get("workspace") == key]
+        actions.append({"workspace": key, "path": info["path"], "from": current, "to": head_before,
+                        "commits": len(commits), "items": items})
+    if blocked:
+        for line in blocked:
+            print(f"[ОТКАЗ] {line}")
+        return 2
+    print_header(f"devctl batch reset {record.get('batchId')}")
+    if not actions:
+        print("Откатывать нечего: workspace уже на HEAD до пачки.")
+        return 0
+    for action in actions:
+        print(f"  {action['workspace']}: {action['from'][:12]} -> {action['to'][:12]} (коммитов: {action['commits']})")
+    if not args.yes:
+        print("\nЭто план. Откатить: `devctl batch reset --yes` (git reset --hard + git clean -fd в каждом workspace).")
+        return 0
+    for action in actions:
+        workspace = discover_workspace_from_override(action["path"])
+        reset_workspace_project(workspace, target=action["to"], clean_mode="fd")
+        state = load_state(workspace)
+        for item in action["items"]:
+            # Журнал помнит применение, а коммита больше нет: отметить откат, чтобы патч снова стал неприменённым.
+            if find_state_run(state, item.get("sha256"), item.get("patchId")) and not patch_seen_in_git(
+                workspace.project_root, item.get("sha256"), item.get("patchId"), limit=1000
+            ):
+                append_run_state(workspace, {
+                    "patchId": item.get("patchId"), "patchFile": item.get("file"), "patchSha256": item.get("sha256"),
+                    "status": "reverted", "batchId": record.get("batchId"), "finishedAt": iso_now(),
+                    "commitSha": item.get("commitSha"),
+                })
+                item["status"] = "reverted"
+        if not args.keep_patches:
+            for item in record.get("items", []):
+                if item.get("workspace") == action["workspace"]:
+                    path = workspace.patches_dir / str(item.get("file"))
+                    if path.is_file():
+                        path.unlink()
+    record["status"] = "reverted"
+    record["revertedAt"] = iso_now()
+    save_batch_record(record)
+    print("\nОткат выполнен.")
+    return 0
+
+
+def batch_command(args: argparse.Namespace) -> int:
+    action = getattr(args, "batch_action", None)
+    if action == "plan":
+        return batch_plan_command(args)
+    if action == "start":
+        return batch_start_command(args)
+    if action == "status":
+        return batch_status_command(args)
+    if action == "reset":
+        return batch_reset_command(args)
+    raise DevctlError("Неизвестная команда batch. Используйте plan/start/status/reset.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=f"devctl v{DEVCTL_VERSION} — проектно-независимый конвейер ИИ-патчей",
@@ -7499,7 +8490,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser._positionals.title = "команды"
     parser._optionals.title = "параметры"
-    subparsers = parser.add_subparsers(dest="command", required=True, metavar="{init,sync,workspace,inbox,status,inspect,plan,start,reset,zip,completion,self}")
+    subparsers = parser.add_subparsers(dest="command", required=True, metavar="{init,sync,workspace,inbox,batch,status,inspect,plan,start,reset,zip,completion,self}")
 
     init = subparsers.add_parser("init", help="Создать или безопасно обновить структуру workspace")
     init.add_argument("--workspace", default=None, help="Корень рабочей области. По умолчанию текущий каталог.")
@@ -7526,12 +8517,20 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--no-uts", action="store_true", help="Не разворачивать свежий архив в UserTestSpace")
 
     workspace_cmd = subparsers.add_parser("workspace", help="Глобальный реестр workspace для Patch Intake")
-    workspace_sub = workspace_cmd.add_subparsers(dest="workspace_action", required=True, metavar="{register}")
+    workspace_sub = workspace_cmd.add_subparsers(dest="workspace_action", required=True, metavar="{register,scan,list}")
     workspace_register = workspace_sub.add_parser("register", help="Зарегистрировать workspace в глобальном config")
     workspace_register.add_argument("path", nargs="?", default=".", help="Путь к workspace или project. По умолчанию текущий каталог.")
     workspace_register.add_argument("--id", default=None, help="Короткий id workspace, например devctl")
     workspace_register.add_argument("--name", default=None, help="Человекочитаемое имя workspace")
     workspace_register.add_argument("--json", action="store_true", help="Вывести машинно-читаемый JSON")
+    workspace_scan = workspace_sub.add_parser("scan", help="Найти workspace на этой машине по .devctl/workspace.json")
+    workspace_scan.add_argument("roots", nargs="*", help="Где искать. По умолчанию домашний каталог")
+    workspace_scan.add_argument("--depth", type=int, default=6, help="Глубина поиска от каждого корня. По умолчанию 6")
+    workspace_scan.add_argument("--register", action="store_true", help="Занести найденные workspace в реестр")
+    workspace_scan.add_argument("--json", action="store_true", help="Вывести машинно-читаемый JSON")
+    workspace_list = workspace_sub.add_parser("list", help="Показать реестр workspace: ветка, HEAD, последний патч")
+    workspace_list.add_argument("--for-agent", action="store_true", help="Текст для нейросети: workspace, их HEAD и правила")
+    workspace_list.add_argument("--json", action="store_true", help="Вывести машинно-читаемый JSON")
 
     inbox = subparsers.add_parser("inbox", help="Принять patch.zip из общего склада в нужный workspace")
     inbox_sub = inbox.add_subparsers(dest="inbox_action", required=True, metavar="{init,scan,grab}")
@@ -7547,6 +8546,22 @@ def build_parser() -> argparse.ArgumentParser:
     inbox_grab.add_argument("--workspace", default=None, help="Принудительно указать id зарегистрированного workspace")
     inbox_grab.add_argument("--json", action="store_true", help="Вывести машинно-читаемый JSON")
 
+    batch_cmd = subparsers.add_parser("batch", help="Пачка патчей для одного или нескольких workspace этой машины")
+    batch_sub = batch_cmd.add_subparsers(dest="batch_action", required=True, metavar="{plan,start,status,reset}")
+    batch_plan = batch_sub.add_parser("plan", help="Проверить пачку целиком и показать порядок; ничего не меняет")
+    batch_plan.add_argument("batch", nargs="?", help="batch_*.zip. По умолчанию самая свежая пачка в складе")
+    batch_plan.add_argument("--json", action="store_true", help="Вывести машинно-читаемый JSON")
+    batch_start = batch_sub.add_parser("start", help="Разложить патчи по workspace и применить по порядку; push в конце")
+    batch_start.add_argument("batch", nargs="?", help="batch_*.zip. По умолчанию самая свежая пачка в складе")
+    batch_start.add_argument("--json", action="store_true", help="Вывести машинно-читаемый JSON")
+    batch_status = batch_sub.add_parser("status", help="Показать последний запуск пачки")
+    batch_status.add_argument("batch_id", nargs="?", help="batchId или runId. По умолчанию последний")
+    batch_status.add_argument("--json", action="store_true", help="Вывести машинно-читаемый JSON")
+    batch_reset = batch_sub.add_parser("reset", help="Откатить неотправленную пачку: каждый workspace к HEAD до пачки")
+    batch_reset.add_argument("batch_id", nargs="?", help="batchId или runId. По умолчанию последний")
+    batch_reset.add_argument("--yes", action="store_true", help="Выполнить откат; без флага только план")
+    batch_reset.add_argument("--keep-patches", action="store_true", help="Не удалять разложенные патчи из patches/")
+
     status = subparsers.add_parser("status", help="Показать состояние рабочей области/Git/патчей без изменений")
     status.add_argument("--json", action="store_true", help="Вывести машинно-читаемый JSON")
     inspect = subparsers.add_parser("inspect", help="Проверить zip-патч без изменения файлов")
@@ -7559,6 +8574,7 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--no-push", action="store_true", help="Отладочный/локальный запуск: commit после зелёных проверок, но без git push")
     start.add_argument("--keep-failed-patch", action="store_true", help="Не удалять patch.zip автоматически после failed checks/partial apply")
     start.add_argument("--json", action="store_true", help="Добавить финальную JSON-строку с reportPath/archivePath/commitSha/pushResult")
+    start.add_argument("--patch", default=None, help="Применить конкретный zip из patches/ вместо следующего по очереди")
 
     reset = subparsers.add_parser("reset", help="Откатить project через git reset --hard и git clean")
     reset.add_argument("--json", action="store_true", help="Вывести машинно-читаемый JSON")
@@ -7613,6 +8629,8 @@ def main(argv: list[str] | None = None) -> int:
             return workspace_command(args)
         if args.command == "inbox":
             return inbox_command(args)
+        if args.command == "batch":
+            return batch_command(args)
         if args.command == "status":
             return status_command(args)
         if args.command == "inspect":

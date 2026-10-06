@@ -6,16 +6,19 @@
 ## Шаги
 
 1. **Поиск workspace и патча.** Кандидаты — все `*.zip` в `patches/`. Берётся самый свежий из тех, что
-   ещё не применялись (см. [commands.md](commands.md#start)). Если таких нет, `start` сообщает об этом
-   и завершается с кодом 0.
+   ещё не применялись, с поправкой на `base.after` (см. [commands.md](commands.md#start)); `--patch`
+   задаёт файл явно. Если таких нет, `start` сообщает об этом и завершается с кодом 0.
 2. **Проверка патча.** Манифест, пути внутри zip, наличие хотя бы одного файла или удаления.
 3. **Предполётная проверка.** До любых изменений на диске:
    - `git` доступен, проект — репозиторий;
    - рабочее дерево чистое;
    - текущая ветка совпадает с `manifest.base.branch`, если она указана;
+   - HEAD начинается с `manifest.base.expectedHead`, если он указан;
+   - патчи из `manifest.base.after` уже применены (журнал или трейлеры `Patch-Id` в истории);
    - если push включён и ветка в remote уже есть — локальная ветка не отстаёт, не опережает и не
      разошлась с ней (перед сравнением выполняется `git fetch`);
-   - рабочие каталоги проверок существуют, команды из `requiredCommands` находятся в `PATH`.
+   - рабочие каталоги проверок существуют или создаются патчем, команды из `requiredCommands`
+     находятся в `PATH`.
 4. **Каталог запуска** `archives/<YYYYMMDD_HHMMSS>_<nameSlug>_<sha7 патча>/` и снимок «до» (`pre_*.zip`).
 5. **Применение.** Сначала удаления из `apply.delete`, затем файлы из `files/` поверх проекта.
    Python bytecode из патча не копируется.
@@ -28,10 +31,12 @@
    Patch-Id: <patchId>
    Patch-SHA256: <sha256 файла патча>
    Devctl-Version: <версия>
+   Devctl-Batch: <batchId>        # только при запуске из пачки
    ```
 
    Перед коммитом `start` останавливается, если в строках `git status` есть сгенерированные или
-   локальные файлы: `.env`, `.env.*`, `*.db`, `*.sqlite`, `*.sqlite3`, `*.pyc`, `*.pyo` либо путь с
+   локальные файлы: `.env`, `.env.*` (кроме шаблонов `.env.example`, `.env.sample`, `.env.template`,
+   `.env.dist`), `*.db`, `*.sqlite`, `*.sqlite3`, `*.pyc`, `*.pyo` либо путь с
    компонентом `node_modules`, `target`, `.git`, `__pycache__`, `patches`, `archives`, `UserTestSpace`.
    Исключение — чистое удаление уже отслеживаемого bytecode.
    Если после патча и проверок изменений нет, коммит и push пропускаются, а запуск считается
@@ -94,7 +99,7 @@ archives/20260101_120000_my-change_ab12cd3/
 
 - путей с компонентом `.git`, `target`, `node_modules`, `dist`, `build`, `coverage`, `logs`, `tmp`,
   `patches`, `archives`, `UserTestSpace`, `__pycache__`;
-- файлов `.env` и `.env.*` (`.env.example` в снимок входит), `*.db`, `*.sqlite`, `*.sqlite3`;
+- файлов `.env` и `.env.*` (шаблоны `.env.example`, `.env.sample`, `.env.template`, `.env.dist` в снимок входят), `*.db`, `*.sqlite`, `*.sqlite3`;
 - того, что перечислено в `manifest.archive.exclude`;
 - `release/*.zip` и `release/*.exe`: вместо них в снимок кладётся текстовая заглушка с перечнем и
   размерами (отключается `archive.includeReleasePayloads: true`).

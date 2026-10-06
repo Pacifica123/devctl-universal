@@ -1,4 +1,4 @@
-# Справочник команд devctl 0.8.0
+# Справочник команд devctl 0.9.0
 
 Общий вид: `devctl [-w WORKSPACE] <команда> [флаги]`. Без установки — `python3 devctl.py …`.
 
@@ -20,7 +20,7 @@
 | Код | Значение |
 | --- | --- |
 | 0 | успех; для `start` также «применять нечего» |
-| 1 | `start`: проверка не прошла, commit или push завершился ошибкой |
+| 1 | `start`: проверка не прошла, commit или push завершился ошибкой; `batch start`: пачка остановилась на патче или push не прошёл |
 | 2 | некорректный патч, непройденная предполётная проверка, ошибка workspace или аргументов |
 | 130 | `start` прерван с клавиатуры |
 
@@ -70,15 +70,19 @@ devctl start --no-push
 ```
 
 Применяет **один** патч — последний неприменённый. Порядок кандидатов: время изменения файла в
-`patches/`, затем `createdAt` из манифеста, затем метка в имени `patch_YYYYMMDD_HHMMSS_*`. Применённым
-считается патч, чей SHA-256 или `patchId` есть в журнале `.devctl/state.json` либо в трейлерах последних
-100 коммитов.
+`patches/`, затем `createdAt` из манифеста, затем метка в имени `patch_YYYYMMDD_HHMMSS_*`. Если выбранный
+патч объявляет `base.after`, а нужный патч лежит в той же очереди и ещё не применён, первым идёт он.
+Поэтому несколько патчей, подготовленных подряд, можно положить в `patches/` разом и вызвать `start`
+столько раз, сколько патчей. Применённым считается патч, чей SHA-256 или `patchId` есть в журнале
+`.devctl/state.json` либо в трейлерах последних 100 коммитов. `base.expectedHead` и `base.after`
+проверяются до снимка «до» и любых изменений.
 
 | Флаг | Назначение |
 | --- | --- |
 | `--no-push` | commit после зелёных проверок, но без `git push` |
 | `--keep-failed-patch` | не удалять patch.zip после упавших проверок или частичного применения |
 | `--json` | финальная JSON-строка: отчёт, архив, коммит, результат push |
+| `--patch NAME.zip` | применить конкретный файл из `patches/` вместо следующего по очереди |
 
 Шаги, статусы и содержимое каталога запуска — в [pipeline.md](pipeline.md).
 
@@ -158,10 +162,45 @@ devctl zip --dry-run
 
 Подробности — в [evolution-archive.md](evolution-archive.md).
 
-## workspace, inbox
+## workspace
 
 ```bash
 devctl workspace register . --id myapp --name "My App"
+devctl workspace scan                 # найти workspace под ~ (глубина 6)
+devctl workspace scan ~/projects --register
+devctl workspace list
+devctl workspace list --for-agent     # текст для нейросети
+```
+
+Реестр workspace этой машины лежит в пользовательском конфиге (см. [configuration.md](configuration.md)).
+
+- `register [путь]` — добавить один workspace; `--id`, `--name` задают идентификатор и имя.
+- `scan [корни…]` — найти каталоги с `.devctl/workspace.json`. Скрытые каталоги, `node_modules`,
+  `target`, `dist`, `build`, `UserTestSpace`, `archives`, `patches` пропускаются, поэтому копии проекта
+  в `UserTestSpace` не считаются отдельными workspace. `--depth N` — глубина от каждого корня,
+  `--register` — занести в реестр всё, что регистрируется (у workspace должны быть проект и `patches/`).
+  Вложенный workspace — отдельная запись со своим путём.
+- `list` — реестр: ветка и HEAD каждого workspace. `--for-agent` печатает то, что отдают нейросети
+  перед сборкой патча или пачки: id, путь, ветку, HEAD, последний применённый `patchId`, ждущие патчи
+  и нестандартные ключи `workspace.json` (правила конкретного workspace). `--json` — то же для программ.
+
+## batch
+
+```bash
+devctl batch plan [batch_*.zip]
+devctl batch start [batch_*.zip]
+devctl batch status [batchId]
+devctl batch reset [batchId] [--yes] [--keep-patches]
+```
+
+Пачка — несколько патчей для одного или нескольких workspace из реестра. `plan` проверяет её целиком и
+ничего не меняет; `start` раскладывает патчи по `patches/`, применяет их по порядку и делает push в
+конце; `reset --yes` возвращает workspace к HEAD до пачки, пока она не отправлена. Без аргумента берётся
+самая свежая пачка из склада `devctl inbox`. Подробности — в [batch.md](batch.md).
+
+## inbox
+
+```bash
 devctl inbox init --path ~/PatchInbox
 devctl inbox scan
 devctl inbox grab
@@ -170,6 +209,7 @@ devctl inbox grab --workspace myapp
 ```
 
 Приём патчей из общего склада в `patches/` нужного workspace. Сам патч при этом не применяется.
+Пачки (`zip` с `batch.json`) `inbox` пропускает: их принимает `devctl batch`.
 Подробности — в [patch-intake.md](patch-intake.md).
 
 ## self, completion

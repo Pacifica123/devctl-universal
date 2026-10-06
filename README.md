@@ -5,7 +5,7 @@
 применяется, коммитится и оставляет после себя полный след — отчёт, логи, снимки проекта и копию для
 ручного тестирования.
 
-Версия: **0.8.0**. Журнал изменений — в [docs/CHANGELOG.md](docs/CHANGELOG.md).
+Версия: **0.9.0**. Журнал изменений — в [docs/CHANGELOG.md](docs/CHANGELOG.md).
 
 ## Что он делает
 
@@ -23,7 +23,10 @@ devctl start
 (`git reset --hard HEAD` + `git clean -fd`) и убирает плохой патч из `patches/`. Откату нужен хотя бы
 один коммит в проекте.
 
-`devctl zip` (новое в 0.8.0) собирает всю историю workspace — коммиты, патчи, запуски, копии проекта и
+`devctl batch` (новое в 0.9.0) применяет пачку патчей сразу к нескольким workspace этой машины: проверяет
+всё до первого изменения, применяет по порядку и делает push только в конце, когда прошло всё.
+
+`devctl zip` (с 0.8.0) собирает всю историю workspace — коммиты, патчи, запуски, копии проекта и
 посторонние материалы вокруг него — в один небольшой архив, который можно целиком отдать нейросети.
 
 ## Быстрый старт
@@ -76,7 +79,9 @@ Workspace ищется от текущего каталога вверх по `.
 | `devctl reset` | откатывает проект и убирает последний упавший патч | да |
 | `devctl sync` | подтягивает проект из remote, делает свежий снимок и копию UTS | да |
 | `devctl zip` | эволюционный архив workspace | только сам архив |
-| `devctl workspace register`, `devctl inbox …` | приём патчей из общего склада | да |
+| `devctl workspace register\|scan\|list` | реестр workspace этой машины; `list --for-agent` — для нейросети | `register`, `scan --register` |
+| `devctl inbox …` | приём патчей из общего склада | да |
+| `devctl batch plan\|start\|status\|reset` | пачка патчей для одного или нескольких workspace | `start`, `reset --yes` |
 | `devctl self …`, `devctl completion …` | установка утилиты и автодополнение | да |
 
 Все флаги и коды возврата — в [docs/commands.md](docs/commands.md).
@@ -117,8 +122,11 @@ devctl zip --level max        # без ограничения: все диффы
 ## Предохранители
 
 - Пути в патче — только относительные POSIX-пути внутри проекта. Записать что-либо в `.git` или
-  принести файл `.env` / `.env.*` патч не может; удалить `.git`, `.devctl`, `node_modules`, `target` —
-  тоже.
+  принести файл `.env` / `.env.*` патч не может (кроме шаблонов `.env.example`, `.env.sample`,
+  `.env.template`, `.env.dist`); удалить `.git`, `.devctl`, `node_modules`, `target` — тоже.
+- `base.expectedHead` и `base.after` в манифесте: патч, собранный против другого HEAD или раньше своих
+  предшественников, останавливается до любых изменений. Несколько связанных патчей можно положить в
+  `patches/` разом — `start` возьмёт их в порядке `base.after`.
 - `start` требует чистое рабочее дерево и, если push включён, совпадение локальной ветки с remote.
 - Python bytecode (`__pycache__/`, `*.pyc`, `*.pyo`) из патча не копируется и удаляется после проверок.
 - Перед коммитом `start` просматривает `git status` и останавливается, если видит там
@@ -135,6 +143,7 @@ devctl zip --level max        # без ограничения: все диффы
 - [docs/configuration.md](docs/configuration.md) — `.devctl/workspace.json`, `state.json`, глобальный конфиг.
 - [docs/evolution-archive.md](docs/evolution-archive.md) — `devctl zip`.
 - [docs/patch-intake.md](docs/patch-intake.md) — приём патчей из общего склада.
+- [docs/batch.md](docs/batch.md) — пачки патчей и реестр workspace машины.
 - [docs/release-cli.md](docs/release-cli.md) — установка, обновление, автодополнение.
 - [docs/CHANGELOG.md](docs/CHANGELOG.md) — история версий.
 

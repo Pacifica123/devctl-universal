@@ -79,7 +79,9 @@ push включён, всегда требует совпадения локал
 
 Запись также хранит сведения об автоматическом откате (`autoResetPerformed`, `autoResetTarget`,
 `autoResetCleanMode`, `autoResetError`), удалении плохого патча (`badPatchDeleted`,
-`badPatchDeleteError`), ошибке копии UTS (`utsError`) и очистке bytecode.
+`badPatchDeleteError`), ошибке копии UTS (`utsError`) и очистке bytecode. Запуск из пачки хранит
+`batchId`. `devctl batch reset --yes` добавляет записи со статусом `reverted`: после такой записи патч
+снова считается неприменённым.
 
 Если проект хранится в Git вместе с `.devctl/workspace.json`, добавьте `.devctl/state.json` в
 `.gitignore`: журнал — локальное состояние машины.
@@ -104,8 +106,10 @@ push включён, всегда требует совпадения локал
   ```
 
 - `inbox_index.json` — что и куда было импортировано (по SHA-256), чтобы не принять патч дважды.
+- `batch_index.json` — запуски пачек: какой патч в каком workspace, HEAD каждого workspace до пачки,
+  коммиты и результат push. По нему работают `devctl batch status` и `devctl batch reset`.
 
-Команды, которые их меняют, описаны в [patch-intake.md](patch-intake.md).
+Команды, которые их меняют, описаны в [patch-intake.md](patch-intake.md) и [batch.md](batch.md).
 
 ## Переменные окружения
 
