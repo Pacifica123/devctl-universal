@@ -35,7 +35,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-DEVCTL_VERSION = "0.9.0"
+DEVCTL_VERSION = "0.10.0"
 STATE_VERSION = 1
 DEFAULT_PROJECT_DIR_NAME = "project"
 DEFAULT_PATCHES_DIR_NAME = "patches"
@@ -443,6 +443,138 @@ def validate_workspace_registerable(workspace: Workspace) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Repository identity: один и тот же workspace на разных машинах
+# ---------------------------------------------------------------------------
+
+# Короткая ссылка `owner/repo` без хоста означает GitHub.
+DEFAULT_REPO_HOST = "github.com"
+REPO_SCP_RE = re.compile(r"^(?:[^@/\s]+@)?([^:/\s]+):(?!//)(.+)$")
+
+
+def repo_key_from_url(url: str | None) -> str | None:
+    """`https://github.com/Owner/Repo.git`, `git@github.com:Owner/Repo.git`, `ssh://…` -> `github.com/owner/repo`.
+
+    Локальные пути и `file://` дают None: у них нет имени, общего для разных машин.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return None
+    text = url.strip()
+    match = re.match(r"^[a-z][a-z0-9+.-]*://(.*)$", text, re.IGNORECASE)
+    if match:
+        if text.lower().startswith("file://"):
+            return None
+        rest = match.group(1)
+        host, _, path = rest.partition("/")
+        host = host.rsplit("@", 1)[-1].split(":", 1)[0]
+    else:
+        scp = REPO_SCP_RE.match(text)
+        if not scp or len(scp.group(1)) == 1:  # `C:\…` — буква диска, а не хост
+            return None
+        host, path = scp.group(1), scp.group(2)
+    path = path.strip("/")
+    if path.lower().endswith(".git"):
+        path = path[:-4]
+    path = path.strip("/")
+    if not host or "." not in host and host != "localhost" or "/" not in path:
+        return None
+    return f"{host.lower()}/{path.lower()}"
+
+
+def normalize_repo_ref(ref: str | None) -> str | None:
+    """Ссылка на репозиторий из batch.json или манифеста: `owner/repo`, `github.com/owner/repo` или URL."""
+    if not isinstance(ref, str) or not ref.strip():
+        return None
+    text = ref.strip()
+    key = repo_key_from_url(text)
+    if key:
+        return key
+    parts = [part for part in text.strip("/").split("/") if part]
+    if parts and parts[-1].lower().endswith(".git"):
+        parts[-1] = parts[-1][:-4]
+    if len(parts) == 2 and all(re.fullmatch(r"[A-Za-z0-9_.-]+", part) for part in parts):
+        return f"{DEFAULT_REPO_HOST}/{parts[0].lower()}/{parts[1].lower()}"
+    if len(parts) >= 3 and "." in parts[0]:
+        return "/".join(part.lower() for part in parts)
+    return None
+
+
+def repo_short(key: str | None) -> str | None:
+    """`github.com/owner/repo` -> `owner/repo`; для других хостов ключ остаётся полным."""
+    if not key:
+        return key
+    prefix = DEFAULT_REPO_HOST + "/"
+    return key[len(prefix):] if key.startswith(prefix) else key
+
+
+def workspace_repo_key(workspace: Workspace) -> str | None:
+    """Репозиторий workspace: remote из `git.remote` (по умолчанию origin), как он записан в .git/config.
+
+    Берётся сырой `remote.<имя>.url`, а не `git remote get-url`: подстановки `insteadOf` у каждой машины
+    свои. Проект без собственного `.git` (вложенный workspace внутри чужого репозитория) имени не получает.
+    """
+    project = workspace.project_root
+    if not (project / ".git").exists() or not git_available():
+        return None
+    remote = workspace_git_config(workspace).get("remote") or "origin"
+    if not isinstance(remote, str) or not remote.strip():
+        remote = "origin"
+    result = git(project, ["config", "--get", f"remote.{remote.strip()}.url"])
+    if result.returncode != 0:
+        return None
+    return repo_key_from_url(result.stdout.strip())
+
+
+def record_repo_key(record: dict[str, Any]) -> str | None:
+    workspace, _error = workspace_record_project(record)
+    return workspace_repo_key(workspace) if workspace is not None else None
+
+
+def resolve_workspace_ref(
+    config: dict[str, Any], *, repo: str | None = None, workspace_id: str | None = None
+) -> tuple[dict[str, Any] | None, str | None, str]:
+    """Найти workspace реестра по репозиторию и/или локальному id.
+
+    Возвращает (запись, ошибка, как найден). Репозиторий одинаков на всех машинах, поэтому он главный;
+    id реестра — локальный псевдоним, он уточняет выбор, если на машине несколько клонов одного репозитория.
+    Значение `workspace`, похожее на `owner/repo`, тоже считается репозиторием, если такого id в реестре нет.
+    """
+    by_id = registered_workspace_by_id(config, workspace_id) if workspace_id else None
+    repo_key = normalize_repo_ref(repo) if repo else None
+    if repo and not repo_key:
+        return None, f"не удалось разобрать репозиторий {repo!r}: ожидается owner/repo, host/owner/repo или URL", ""
+    if not repo_key and workspace_id and by_id is None and "/" in workspace_id:
+        repo_key = normalize_repo_ref(workspace_id)
+        workspace_id = None
+    if not repo_key:
+        if by_id is None:
+            return None, f"workspace {workspace_id!r} нет в реестре этой машины (`devctl workspace scan --register`)", ""
+        return by_id, None, "по id реестра"
+    records = [record for record in config.get("workspaces", []) if isinstance(record, dict)]
+    matches = [record for record in records if record_repo_key(record) == repo_key]
+    label = repo_short(repo_key)
+    if by_id is not None:
+        if any(record is by_id for record in matches):
+            return by_id, None, f"по репозиторию {label} и id {by_id.get('id')}"
+        return None, (
+            f"workspace {workspace_id!r} есть в реестре, но его remote — не {label}"
+        ), ""
+    if workspace_id:
+        return None, f"workspace {workspace_id!r} нет в реестре этой машины (`devctl workspace scan --register`)", ""
+    if not matches:
+        return None, (
+            f"на этой машине нет зарегистрированного workspace с репозиторием {label} "
+            "(`devctl workspace scan --register`; remote проверяется в `devctl workspace list`)"
+        ), ""
+    if len(matches) > 1:
+        listed = ", ".join(f"{record.get('id')} ({record.get('path')})" for record in matches)
+        return None, (
+            f"репозиторий {label} зарегистрирован несколько раз: {listed}. "
+            "Уточните workspace в batch.json или уберите лишний клон из реестра"
+        ), ""
+    return matches[0], None, f"по репозиторию {label}"
+
+
 def inbox_root_dirs(config: dict[str, Any]) -> list[Path]:
     result: list[Path] = []
     seen: set[str] = set()
@@ -531,6 +663,7 @@ def manifest_target_hints(manifest: dict[str, Any] | None) -> dict[str, Any]:
     hints = {
         "projectId": target.get("projectId"),
         "workspaceId": target.get("workspaceId"),
+        "repo": target.get("repo"),
         "projectName": target.get("projectName"),
         "expectedFiles": target.get("expectedFiles") if isinstance(target.get("expectedFiles"), list) else [],
     }
@@ -575,6 +708,7 @@ def detect_inbox_target(candidate: PatchCandidate, config: dict[str, Any]) -> di
 
     ids = {str(value).strip().lower() for value in (target.get("projectId"), target.get("workspaceId")) if isinstance(value, str) and value.strip()}
     names = {str(value).strip().lower() for value in (target.get("projectName"),) if isinstance(value, str) and value.strip()}
+    target_repo = normalize_repo_ref(target.get("repo")) if isinstance(target.get("repo"), str) else None
 
     candidates: list[dict[str, Any]] = []
     for record in config.get("workspaces", []):
@@ -599,6 +733,10 @@ def detect_inbox_target(candidate: PatchCandidate, config: dict[str, Any]) -> di
             if record_id and record_id.lower() in ids:
                 item["idMatch"] = True
                 item["score"] += 20
+            if target_repo and workspace_repo_key(workspace) == target_repo:
+                item["idMatch"] = True
+                item["repoMatch"] = True
+                item["score"] += 30
             if record_name and record_name.lower() in names:
                 item["nameMatch"] = True
                 item["score"] += 8
@@ -898,6 +1036,7 @@ def workspace_agent_info(record: dict[str, Any]) -> dict[str, Any]:
         remote_url = git_remote_url(project)
         if remote_url:
             info["remote"] = evo_strip_url_credentials(remote_url)
+        info["repo"] = repo_short(workspace_repo_key(workspace))
         info["lastAppliedPatch"] = git_last_applied_patch(project)
     else:
         info["gitError"] = "проект не является Git-репозиторием"
@@ -916,11 +1055,13 @@ def render_workspaces_for_agent(items: list[dict[str, Any]]) -> str:
         "",
         "Патч для одного workspace — обычный patch.zip (devctl docs/patch-format.md).",
         "Несколько патчей сразу, в том числе для разных workspace, — пачка batch_*.zip (devctl docs/batch.md):",
-        "в batch.json укажите workspace (id ниже) и expectedHead = head ниже для первого патча каждого workspace.",
+        "в batch.json укажите repo (ниже; одинаков на всех машинах) и expectedHead = head ниже для первого",
+        "патча каждого репозитория. id workspace — локальный псевдоним этой машины: в пачку его не пишите.",
         "",
     ]
     for item in items:
-        lines.append(f"## {item.get('id')} — {item.get('name')}")
+        lines.append(f"## {item.get('repo') or item.get('id')} — {item.get('name')}")
+        lines.append(f"- id на этой машине: {item.get('id')}")
         if not item.get("available"):
             lines.append(f"- недоступен: {item.get('error')}")
             lines.append("")
@@ -933,6 +1074,8 @@ def render_workspaces_for_agent(items: list[dict[str, Any]]) -> str:
             lines.append(f"- ветка {item.get('branch')}, head {item.get('head')}{dirty}")
             if item.get("remote"):
                 lines.append(f"- remote: {item.get('remote')}; push после коммита: {'да' if item.get('autoPush') else 'нет'}")
+            lines.append(f"- repo для batch.json: {item.get('repo')}" if item.get("repo") else
+                         "- repo: нет (remote не задан или локальный) — в batch.json только id этой машины")
             last = item.get("lastAppliedPatch")
             lines.append(f"- последний применённый патч: {last.get('patchId')} ({str(last.get('commit'))[:12]})" if last else "- применённых патчей в истории нет")
         pending = item.get("pendingPatches") or []
@@ -1014,6 +1157,7 @@ def workspace_list_command(args: argparse.Namespace) -> int:
     for item in items:
         state = "недоступен" if not item.get("available") else f"{item.get('branch') or '-'} @ {str(item.get('head') or '-')[:12]}"
         print(f"{item.get('id'):<24} {state:<28} {item.get('path')}")
+        print(f"{'':<24} repo: {item.get('repo') or '-'}")
     return 0
 
 
@@ -7962,13 +8106,24 @@ def read_batch(path: Path) -> dict[str, Any]:
             raise InvalidPatchError(f"Два патча пачки называются одинаково: {basename}")
         basenames.add(basename)
         workspace_id = item.get("workspace")
-        if not isinstance(workspace_id, str) or not workspace_id.strip():
-            raise InvalidPatchError(f"batch.items[{index}].workspace должен быть id workspace из реестра")
+        repo = item.get("repo")
+        for key, value in (("workspace", workspace_id), ("repo", repo)):
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise InvalidPatchError(f"batch.items[{index}].{key} должен быть непустой строкой")
+        if workspace_id is None and repo is None:
+            raise InvalidPatchError(
+                f"batch.items[{index}]: укажите repo (owner/repo из remote) или workspace (id реестра этой машины)"
+            )
+        if repo is not None and normalize_repo_ref(repo) is None:
+            raise InvalidPatchError(f"batch.items[{index}].repo не похож на репозиторий: {repo!r}")
+        ref = (repo or workspace_id).strip()
         expected = item.get("expectedHead")
         if expected is not None and (not isinstance(expected, str) or len(expected.strip()) < 7):
             raise InvalidPatchError(f"batch.items[{index}].expectedHead должен быть SHA не короче 7 символов")
         normalized.append(
-            {"index": index, "patch": member, "file": basename, "workspace": workspace_id.strip(),
+            {"index": index, "patch": member, "file": basename, "workspace": ref, "ref": ref,
+             "repo": repo.strip() if isinstance(repo, str) else None,
+             "workspaceId": workspace_id.strip() if isinstance(workspace_id, str) else None,
              "expectedHead": expected.strip().lower() if isinstance(expected, str) else None}
         )
     data["push"] = push
@@ -8062,22 +8217,26 @@ def build_batch_plan(batch_path: Path, *, fetch: bool = True) -> dict[str, Any]:
                 step["problems"].append(str(exc))
                 continue
 
-            record = registered_workspace_by_id(config, item["workspace"])
+            record, error, how = resolve_workspace_ref(config, repo=item["repo"], workspace_id=item["workspaceId"])
             if record is None:
-                step["problems"].append(
-                    f"workspace {item['workspace']!r} нет в реестре этой машины (`devctl workspace scan --register`)"
-                )
+                step["problems"].append(str(error))
                 continue
             workspace, error = workspace_record_project(record)
             if workspace is None:
-                step["problems"].append(f"workspace {item['workspace']!r} недоступен: {error}")
+                step["problems"].append(f"workspace {item['ref']!r} недоступен: {error}")
                 continue
+            # Дальше пачка работает с локальным id реестра: он однозначен на этой машине,
+            # а ссылка из batch.json (repo) остаётся в step["ref"] для вывода.
+            key = str(record.get("id") or record.get("path"))
+            step["workspace"] = key
+            step["resolvedBy"] = how
             step["workspacePath"] = record.get("path")
-            ws = workspaces.get(item["workspace"])
+            ws = workspaces.get(key)
             if ws is None:
                 ws = {"workspace": workspace, "path": record.get("path"), "patchIds": set(), "payload": [],
-                      "firstPending": True, "state": load_state(workspace), "items": []}
-                workspaces[item["workspace"]] = ws
+                      "firstPending": True, "state": load_state(workspace), "items": [],
+                      "repo": repo_short(workspace_repo_key(workspace))}
+                workspaces[key] = ws
             ws["items"].append(item["index"])
             state = ws["state"]
 
@@ -8110,7 +8269,11 @@ def build_batch_plan(batch_path: Path, *, fetch: bool = True) -> dict[str, Any]:
                         f"пачка собрана против {expected[:12]}, а HEAD — {ws['headBefore'][:12]}"
                     )
                 if not expected:
-                    warnings.append(f"{item['file']}: не указан expectedHead; база не сверяется")
+                    after = manifest_after_ids(candidate.manifest)
+                    warnings.append(
+                        f"{item['file']}: не указан expectedHead; база сверяется только по base.after ({', '.join(after)})"
+                        if after else f"{item['file']}: не указан expectedHead; база не сверяется"
+                    )
             else:
                 if item.get("expectedHead") or manifest_base(candidate.manifest).get("expectedHead"):
                     step["problems"].append(
@@ -8149,7 +8312,8 @@ def build_batch_plan(batch_path: Path, *, fetch: bool = True) -> dict[str, Any]:
         "batchSha256": sha256_file(batch_path),
         "steps": steps,
         "workspaces": {
-            key: {"path": value["path"], "headBefore": value.get("headBefore"), "items": value["items"]}
+            key: {"path": value["path"], "repo": value.get("repo"), "headBefore": value.get("headBefore"),
+                  "items": value["items"]}
             for key, value in workspaces.items()
         },
         "problems": problems,
@@ -8168,8 +8332,8 @@ def batch_plan_to_json(plan: dict[str, Any]) -> dict[str, Any]:
         "batchPath": plan["batchPath"],
         "push": batch.get("push"),
         "steps": [
-            {key: step.get(key) for key in ("index", "file", "workspace", "workspacePath", "patchId", "title",
-                                            "status", "head", "expectedHead", "sha256", "problems")}
+            {key: step.get(key) for key in ("index", "file", "ref", "workspace", "workspacePath", "resolvedBy", "patchId",
+                                            "title", "status", "head", "expectedHead", "sha256", "problems")}
             for step in plan["steps"]
         ],
         "workspaces": plan["workspaces"],
@@ -8187,7 +8351,10 @@ def print_batch_plan(plan: dict[str, Any]) -> None:
     print(f"Push:  {batch.get('push')}")
     for step in plan["steps"]:
         status = {"already_applied": "уже применён", "pending": "применить"}.get(step.get("status"), "?")
-        print(f"\n[{step['index'] + 1}] {step['file']} -> {step['workspace']}  ({status})")
+        target = step["workspace"] if step.get("ref") == step["workspace"] else f"{step.get('ref')} = {step['workspace']}"
+        print(f"\n[{step['index'] + 1}] {step['file']} -> {target}  ({status})")
+        if step.get("workspacePath"):
+            print(f"    путь:    {step['workspacePath']} ({step.get('resolvedBy')})")
         if step.get("patchId"):
             print(f"    patchId: {step['patchId']}")
         if step.get("head"):
@@ -8257,13 +8424,12 @@ def batch_start_command(args: argparse.Namespace) -> int:
             ],
         }
         save_batch_record(record)
-        config = load_global_config()
 
         # 1. Раскладка: каждый патч в patches/ своего workspace.
         for step in plan["steps"]:
             if step.get("status") != "pending":
                 continue
-            workspace, _ = workspace_record_project(registered_workspace_by_id(config, step["workspace"]) or {})
+            workspace, _ = workspace_record_project({"path": step["workspacePath"]})
             assert workspace is not None
             workspace.patches_dir.mkdir(parents=True, exist_ok=True)
             destination = workspace.patches_dir / step["file"]

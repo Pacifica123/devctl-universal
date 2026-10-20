@@ -12,7 +12,13 @@ batch_YYYYMMDD_HHMMSS_slug.zip → склад (devctl inbox) → devctl batch pl
 
 У одиночного патча опора — workspace и его `patches/`. У пачки опора — машина: реестр workspace в
 пользовательском конфиге и склад патчей ([patch-intake.md](patch-intake.md)). Поэтому пачку кладут в
-склад (`incoming/`) или передают командам путём, а workspace в ней называют по id из реестра.
+склад (`incoming/`) или передают командам путём.
+
+Workspace в пачке называют **репозиторием** (`"repo": "owner/repo"`), а не id реестра. id — локальный
+псевдоним: один и тот же репозиторий на ноутбуке может быть зарегистрирован как `p2p-ecosystem`, а на
+другом ПК как `p2pkanban_ecosystem`. Репозиторий же один: devctl берёт его из URL remote проекта
+(`git.remote` workspace, по умолчанию `origin`), поэтому пачка подходит любой машине, где он склонирован
+и зарегистрирован.
 
 Реестр заполняется один раз:
 
@@ -21,8 +27,8 @@ devctl workspace scan --register      # найти все workspace под ~ и 
 devctl workspace list --for-agent     # отдать нейросети вместе с devctl
 ```
 
-`list --for-agent` сообщает нейросети id, ветку и HEAD каждого workspace. Без HEAD пачку нельзя собрать
-против верной базы.
+`list --for-agent` сообщает нейросети репозиторий, ветку и HEAD каждого workspace. Без HEAD пачку нельзя
+собрать против верной базы.
 
 ## Формат
 
@@ -43,12 +49,12 @@ batch_20261007_120000_ring-r1.zip
   "formatVersion": 1,
   "batchId": "2026-10-07-ring-r1",
   "title": "Кольцо устройств: R1",
-  "requiresDevctl": ">=0.9.0",
+  "requiresDevctl": ">=0.10.0",
   "push": "after-all",
   "items": [
-    {"patch": "patches/patch_20261007_120000_web-x.zip", "workspace": "p2p-kanban", "expectedHead": "749b3d0"},
-    {"patch": "patches/patch_20261007_120100_mobile-y.zip", "workspace": "p2p-kanban"},
-    {"patch": "patches/patch_20261007_120200_devctl-z.zip", "workspace": "devctl", "expectedHead": "301384c"}
+    {"patch": "patches/patch_20261007_120000_web-x.zip", "repo": "me/p2p-kanban", "expectedHead": "749b3d0"},
+    {"patch": "patches/patch_20261007_120100_mobile-y.zip", "repo": "me/p2p-kanban"},
+    {"patch": "patches/patch_20261007_120200_devctl-z.zip", "repo": "me/devctl", "expectedHead": "301384c"}
   ]
 }
 ```
@@ -61,8 +67,21 @@ batch_20261007_120000_ring-r1.zip
 | `requiresDevctl` | `>=X.Y.Z`, `>X.Y.Z`, `==X.Y.Z` или `X.Y.Z` (то же, что `>=`). Старый devctl откажется от пачки целиком |
 | `push` | `after-all` (по умолчанию) — push всех workspace только когда прошли все патчи; `each` — push после каждого патча, как у `start`; `none` — без push |
 | `items[].patch` | путь патча внутри пачки; имена файлов в пачке не повторяются |
-| `items[].workspace` | id или имя workspace из реестра этой машины |
+| `items[].repo` | репозиторий workspace: `owner/repo` (GitHub), `host/owner/repo` или URL remote; регистр не важен. С 0.10.0 |
+| `items[].workspace` | id или имя workspace из реестра этой машины. Вместе с `repo` — уточнение, если репозиторий склонирован на машине дважды. Без `repo` — как в 0.9.0 (тогда пачка привязана к машине) |
 | `items[].expectedHead` | SHA, против которого собран патч. Допустим только у **первого** патча каждого workspace: HEAD для следующих появится после применения предыдущих. То же можно указать в манифесте патча как `base.expectedHead` |
+
+Нужно хотя бы одно из `repo` и `workspace`. Как ищется workspace:
+
+- `repo` — среди workspace реестра тот, чей remote указывает на этот репозиторий. Не нашёлся — проблема
+  «нет зарегистрированного workspace с репозиторием»; нашлось несколько (два клона) — проблема с их
+  списком, уточните `workspace`.
+- `repo` и `workspace` — workspace с этим id, и его remote обязан быть этим репозиторием.
+- только `workspace` — по id реестра. Если такого id нет, а значение похоже на `owner/repo`, оно считается
+  репозиторием.
+
+Перерегистрация после обновления до 0.10.0 не нужна: репозиторий читается из `.git/config` проекта при
+каждом запуске. Проверить, что видит devctl: `devctl workspace list` (строка `repo:`).
 
 Порядок применения — порядок `items`. Связи между патчами одного workspace можно продублировать в их
 манифестах через `base.after`; `plan` проверит, что каждый такой патч либо уже в истории, либо стоит в
@@ -73,7 +92,7 @@ batch_20261007_120000_ring-r1.zip
 `devctl batch plan [пачка]` ничего не меняет. Для каждого патча:
 
 - манифест и пути корректны;
-- workspace есть в реестре и доступен;
+- workspace найден в реестре (по `repo` или id) и доступен; `plan` печатает, какой выбран и почему;
 - патч ещё не применён (применённые помечаются и при `start` пропускаются);
 - для первого патча workspace: дерево чистое, ветка из `base.branch`, HEAD совпадает с `expectedHead`;
   при включённом push — remote не ушёл вперёд, а локально впереди только коммиты этой же пачки;
